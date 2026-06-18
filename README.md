@@ -7,7 +7,7 @@
 ## 安装(Claude Code)
 
 ```
-/plugin marketplace add <your-github-user>/keil2clangd
+/plugin marketplace add patrick1099/keil2clangd
 /plugin install keil2clangd@keil2clangd
 ```
 
