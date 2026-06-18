@@ -1,0 +1,14 @@
+{
+  "name": "keil2clangd",
+  "owner": { "name": "xu" },
+  "metadata": {
+    "description": "Keil/IAR 工程的 clangd 配置生成插件"
+  },
+  "plugins": [
+    {
+      "name": "keil2clangd",
+      "source": ".",
+      "description": "从 Keil .uvprojx / IAR .ewp 工程生成并校验 .clangd + compile_commands.json,让 clangd 对嵌入式 C 工程做跳转/补全/诊断"
+    }
+  ]
+}
