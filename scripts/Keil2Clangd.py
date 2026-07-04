@@ -624,11 +624,13 @@ class ClangdGenerator:
 class CompileCommandsGenerator:
     """Generate compile_commands.json for clangd / IDE integration."""
 
-    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None):
+    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
+                 enrichment=None):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+        self.enrichment = enrichment
 
     def generate(self):
         """Return a list of compile-command entry dicts."""
@@ -638,6 +640,10 @@ class CompileCommandsGenerator:
         defines = self.parser.get_defines()
         include_paths = self.parser.get_include_paths()
         source_files = self.parser.get_source_files()
+        enr = self.enrichment
+        use_enr = bool(enr and enr.found and not enr.stale)
+        if use_enr and enr.source_files:
+            source_files = enr.source_files
 
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
         arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
@@ -674,15 +680,32 @@ class CompileCommandsGenerator:
                 formatted = _format_path(ki, self.base_dir, self.use_absolute)
                 base_args.append(f"-I{formatted}")
 
+        # .dep enrichment: compiler system includes (XML can't provide these)
+        if use_enr:
+            existing = {a for a in base_args if a.startswith("-I")}
+            for inc in enr.system_includes:
+                formatted = _format_path(inc, self.base_dir, self.use_absolute)
+                flag = f"-I{formatted}"
+                if flag not in existing:
+                    base_args.append(flag)
+                    existing.add(flag)
+
         compiler = "arm-none-eabi-gcc"
+
+        preinclude_args = []
+        if use_enr:
+            for pf in enr.preinclude_files:
+                formatted = _format_path(pf, self.base_dir, self.use_absolute)
+                preinclude_args += ["-imacros", formatted]
 
         entries = []
         for sf in source_files:
             file_str = _format_path(sf, self.base_dir, self.use_absolute)
-            command = f"{compiler} -c {file_str} " + " ".join(base_args)
+            file_args = base_args + preinclude_args
+            command = f"{compiler} -c {file_str} " + " ".join(file_args)
             entry = {
                 "command": command,
-                "arguments": [compiler, "-c", file_str] + base_args,
+                "arguments": [compiler, "-c", file_str] + file_args,
                 "directory": dir_str,
                 "file": file_str,
             }
