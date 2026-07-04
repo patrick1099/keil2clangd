@@ -251,6 +251,52 @@ def _parse_dep_text(text):
     }
 
 
+class DepParser:
+    """Locate and parse a target's Keil .dep, producing a DepEnrichment.
+
+    Degrades gracefully: missing/unreadable .dep -> found=False; a .dep older
+    than the .uvprojx -> found=True, stale=True (caller ignores its data).
+    """
+
+    def __init__(self, uvprojx_parser, dep_path_override=None):
+        self.p = uvprojx_parser
+        self.override = dep_path_override
+
+    def locate(self):
+        if self.override:
+            cand = Path(self.override)
+            return cand if cand.exists() else None
+        out_dir = self.p.get_output_dir()
+        name = "{0}_{1}.dep".format(self.p.project_name, self.p.get_target_name())
+        cand = (self.p.project_root / out_dir / name)
+        return cand if cand.exists() else None
+
+    def parse(self):
+        try:
+            dep_path = self.locate()
+            if dep_path is None:
+                return DepEnrichment(found=False)
+
+            uv_mtime = self.p.file_path.stat().st_mtime
+            dep_mtime = dep_path.stat().st_mtime
+            if uv_mtime > dep_mtime:
+                return DepEnrichment(found=True, stale=True, dep_path=dep_path)
+
+            raw = _parse_dep_text(dep_path.read_text(encoding="utf-8", errors="ignore"))
+            root = self.p.project_root
+            return DepEnrichment(
+                found=True,
+                stale=False,
+                dep_path=dep_path,
+                system_includes=[Path(s) for s in raw["system_includes"]],
+                preinclude_files=[(root / f).resolve() for f in raw["preinclude_files"]],
+                source_files=[(root / f).resolve() for f in raw["source_files"]],
+            )
+        except Exception as exc:  # never break the main flow
+            print("WARNING: .dep parse failed ({0}); using .uvprojx only.".format(exc))
+            return DepEnrichment(found=False)
+
+
 # ---------------------------------------------------------------------------
 # KeilPathResolver
 # ---------------------------------------------------------------------------
