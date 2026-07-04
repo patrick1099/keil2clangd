@@ -529,11 +529,13 @@ class ClangdGenerator:
         "-Wstrict-prototypes",
     ]
 
-    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None):
+    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
+                 enrichment=None):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+        self.enrichment = enrichment
 
     def generate(self):
         """Return the .clangd YAML string."""
@@ -587,6 +589,24 @@ class ClangdGenerator:
                 for ki in keil_incs:
                     formatted = _format_path(ki, self.base_dir, self.use_absolute)
                     lines.append(f"    - -I{formatted}")
+
+        # .dep enrichment: system includes + forced preinclude macros
+        enr = self.enrichment
+        if enr and enr.found and not enr.stale:
+            existing = {ln.strip() for ln in lines}
+            if enr.system_includes:
+                lines.append("    # Compiler system headers (from .dep)")
+                for inc in enr.system_includes:
+                    formatted = _format_path(inc, self.base_dir, self.use_absolute)
+                    flag = f"    - -I{formatted}"
+                    if flag.strip() not in existing:
+                        lines.append(flag)
+            if enr.preinclude_files:
+                lines.append("    # Preinclude headers (from .dep)")
+                for pf in enr.preinclude_files:
+                    formatted = _format_path(pf, self.base_dir, self.use_absolute)
+                    lines.append(f"    - -imacros")
+                    lines.append(f"    - {formatted}")
 
         # Remove flags
         lines.append("  Remove:")
