@@ -12,6 +12,8 @@ import json
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +165,78 @@ class UvprojxParser:
                     resolved = (self.project_root / raw).resolve()
                     files.append(resolved)
         return files
+
+
+# ---------------------------------------------------------------------------
+# .dep enrichment (ground-truth from Keil build output)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DepEnrichment:
+    """Supplementary build facts parsed from a Keil .dep file.
+
+    Only fields that .uvprojx XML cannot provide. Never carries -D macros or
+    project -I paths — those stay sourced from live XML.
+    """
+    found: bool = False
+    stale: bool = False
+    dep_path: Optional[Path] = None
+    system_includes: List[Path] = field(default_factory=list)
+    preinclude_files: List[Path] = field(default_factory=list)
+    source_files: List[Path] = field(default_factory=list)
+
+
+_F_LINE_RE = re.compile(r'^F \((?P<file>[^)]+)\)')
+_PREINCLUDE_RE = re.compile(
+    r'(?:--preinclude|-imacros)\s+"?(?P<a>[^"\s)]+)'
+    r'|-preinclude="?(?P<b>[^"\s)]+)')
+_TOOLCHAIN_RE = re.compile(r'^Toolchain Path:\s*(?P<p>.+?)\s*$')
+
+
+def _dedup(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _parse_dep_text(text):
+    """Parse raw .dep text into supplementary build facts (raw strings).
+
+    Returns dict with system_includes / preinclude_files / source_files,
+    forward-slashed and order-preserving deduped. Does NOT extract -D/-I.
+    """
+    sources = []
+    preincludes = []
+    sysincs = []
+    for raw_line in text.splitlines():
+        line = raw_line.replace('\\', '/').rstrip('\r')
+
+        tc = _TOOLCHAIN_RE.match(line)
+        if tc:
+            p = tc.group('p').rstrip('/')
+            # .../Bin -> .../Include
+            for tail in ('/Bin', '/bin'):
+                if p.endswith(tail):
+                    p = p[: -len(tail)] + '/Include'
+                    break
+            sysincs.append(p)
+            continue
+
+        fm = _F_LINE_RE.match(line)
+        if fm:
+            sources.append(fm.group('file').strip())
+            for m in _PREINCLUDE_RE.finditer(line):
+                preincludes.append(m.group('a') or m.group('b'))
+
+    return {
+        "system_includes": _dedup(sysincs),
+        "preinclude_files": _dedup(preincludes),
+        "source_files": _dedup(sources),
+    }
 
 
 # ---------------------------------------------------------------------------
