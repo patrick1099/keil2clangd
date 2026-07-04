@@ -35,6 +35,15 @@ class TestParseDepText(unittest.TestCase):
         r = k2c._parse_dep_text("")
         self.assertEqual(r, {"system_includes": [], "preinclude_files": [], "source_files": []})
 
+    def test_extracts_quoted_preinclude_with_spaces(self):
+        dep = (
+            r'F (.\User\main.c)(0x5F3A1B2C)(--c99 -c --cpu Cortex-M3 -D__DEBUG '
+            r' -I.\User  --preinclude "./My Proj/preinc.h"  -o .\Objects\main.o)'
+            + "\n"
+        )
+        r = k2c._parse_dep_text(dep)
+        self.assertIn("./My Proj/preinc.h", r["preinclude_files"])
+
 
 if __name__ == "__main__":
     unittest.main()
