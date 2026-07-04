@@ -166,6 +166,18 @@ class UvprojxParser:
                     files.append(resolved)
         return files
 
+    @property
+    def project_name(self):
+        return self.file_path.stem
+
+    def get_output_dir(self):
+        """Relative build output dir (forward slashes). Fallback: 'Objects'."""
+        elem = self.target.find('.//TargetOption/TargetCommonOption/OutputDirectory')
+        if elem is not None and elem.text and elem.text.strip():
+            d = elem.text.strip().replace('\\', '/').rstrip('/')
+            return d if d else "Objects"
+        return "Objects"
+
 
 # ---------------------------------------------------------------------------
 # .dep enrichment (ground-truth from Keil build output)
