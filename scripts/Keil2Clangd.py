@@ -866,6 +866,10 @@ def main():
                     help='Print info without writing any files')
     ap.add_argument('-o', '--output', default='.',
                     help='Output directory (default: current dir)')
+    ap.add_argument('--no-dep', action='store_true',
+                    help='Ignore Keil .dep build output; use .uvprojx only')
+    ap.add_argument('--dep-path', default=None,
+                    help='Explicit path to the target .dep file')
 
     args = ap.parse_args()
 
@@ -891,6 +895,23 @@ def main():
     # Always print macro / path check
     check_macros(parser, keil)
 
+    # Build .dep enrichment (ground-truth supplement; XML stays authoritative)
+    enrichment = DepEnrichment(found=False)
+    if not args.no_dep:
+        enrichment = DepParser(parser, dep_path_override=args.dep_path).parse()
+        if enrichment.found and not enrichment.stale:
+            print(f".dep: using {enrichment.dep_path} "
+                  f"(+{len(enrichment.system_includes)} sysinc, "
+                  f"+{len(enrichment.preinclude_files)} preinclude, "
+                  f"{len(enrichment.source_files)} files)")
+        elif enrichment.stale:
+            print(f".dep: STALE ({enrichment.dep_path} older than .uvprojx) — "
+                  f"ignored; rebuild the project to refresh system headers/preincludes.")
+        else:
+            print(".dep: not found — using .uvprojx only (no build output).")
+    else:
+        print(".dep: skipped (--no-dep).")
+
     if args.dry_run:
         print("--dry-run: no files written.")
         return 0
@@ -899,13 +920,15 @@ def main():
     if not args.no_clangd:
         gen = ClangdGenerator(parser, keil,
                               use_absolute=args.absolute,
-                              base_dir=output_dir)
+                              base_dir=output_dir,
+                              enrichment=enrichment)
         gen.write(output_dir)
 
     if not args.no_compile_commands:
         gen = CompileCommandsGenerator(parser, keil,
                                        use_absolute=args.absolute,
-                                       base_dir=output_dir)
+                                       base_dir=output_dir,
+                                       enrichment=enrichment)
         gen.write(output_dir)
 
     return 0
