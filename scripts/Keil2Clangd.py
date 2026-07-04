@@ -200,8 +200,8 @@ class DepEnrichment:
 
 _F_LINE_RE = re.compile(r'^F \((?P<file>[^)]+)\)')
 _PREINCLUDE_RE = re.compile(
-    r'(?:--preinclude|-imacros)\s+"?(?P<a>[^"\s)]+)'
-    r'|-preinclude="?(?P<b>[^"\s)]+)')
+    r'(?:--preinclude|-imacros)\s+(?:"(?P<a>[^"]+)"|(?P<b>[^"\s)]+))'
+    r'|-preinclude=(?:"(?P<c>[^"]+)"|(?P<d>[^"\s)]+))')
 _TOOLCHAIN_RE = re.compile(r'^Toolchain Path:\s*(?P<p>.+?)\s*$')
 
 
@@ -242,7 +242,8 @@ def _parse_dep_text(text):
         if fm:
             sources.append(fm.group('file').strip())
             for m in _PREINCLUDE_RE.finditer(line):
-                preincludes.append(m.group('a') or m.group('b'))
+                preincludes.append(
+                    m.group('a') or m.group('b') or m.group('c') or m.group('d'))
 
     return {
         "system_includes": _dedup(sysincs),
@@ -601,11 +602,12 @@ class ClangdGenerator:
                     flag = f"    - -I{formatted}"
                     if flag.strip() not in existing:
                         lines.append(flag)
+                        existing.add(flag.strip())
             if enr.preinclude_files:
                 lines.append("    # Preinclude headers (from .dep)")
                 for pf in enr.preinclude_files:
                     formatted = _format_path(pf, self.base_dir, self.use_absolute)
-                    lines.append(f"    - -imacros")
+                    lines.append("    - -imacros")
                     lines.append(f"    - {formatted}")
 
         # Remove flags
