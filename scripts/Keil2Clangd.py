@@ -12,6 +12,8 @@ import json
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +165,137 @@ class UvprojxParser:
                     resolved = (self.project_root / raw).resolve()
                     files.append(resolved)
         return files
+
+    @property
+    def project_name(self):
+        return self.file_path.stem
+
+    def get_output_dir(self):
+        """Relative build output dir (forward slashes). Fallback: 'Objects'."""
+        elem = self.target.find('.//TargetOption/TargetCommonOption/OutputDirectory')
+        if elem is not None and elem.text and elem.text.strip():
+            d = elem.text.strip().replace('\\', '/').rstrip('/')
+            return d if d else "Objects"
+        return "Objects"
+
+
+# ---------------------------------------------------------------------------
+# .dep enrichment (ground-truth from Keil build output)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DepEnrichment:
+    """Supplementary build facts parsed from a Keil .dep file.
+
+    Only fields that .uvprojx XML cannot provide. Never carries -D macros or
+    project -I paths — those stay sourced from live XML.
+    """
+    found: bool = False
+    stale: bool = False
+    dep_path: Optional[Path] = None
+    system_includes: List[Path] = field(default_factory=list)
+    preinclude_files: List[Path] = field(default_factory=list)
+    source_files: List[Path] = field(default_factory=list)
+
+
+_F_LINE_RE = re.compile(r'^F \((?P<file>[^)]+)\)')
+_PREINCLUDE_RE = re.compile(
+    r'(?:--preinclude|-imacros)\s+(?:"(?P<a>[^"]+)"|(?P<b>[^"\s)]+))'
+    r'|-preinclude=(?:"(?P<c>[^"]+)"|(?P<d>[^"\s)]+))')
+_TOOLCHAIN_RE = re.compile(r'^Toolchain Path:\s*(?P<p>.+?)\s*$')
+
+
+def _dedup(seq):
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _parse_dep_text(text):
+    """Parse raw .dep text into supplementary build facts (raw strings).
+
+    Returns dict with system_includes / preinclude_files / source_files,
+    forward-slashed and order-preserving deduped. Does NOT extract -D/-I.
+    """
+    sources = []
+    preincludes = []
+    sysincs = []
+    for raw_line in text.splitlines():
+        line = raw_line.replace('\\', '/').rstrip('\r')
+
+        tc = _TOOLCHAIN_RE.match(line)
+        if tc:
+            p = tc.group('p').rstrip('/')
+            # .../Bin -> .../Include
+            for tail in ('/Bin', '/bin'):
+                if p.endswith(tail):
+                    p = p[: -len(tail)] + '/Include'
+                    break
+            sysincs.append(p)
+            continue
+
+        fm = _F_LINE_RE.match(line)
+        if fm:
+            sources.append(fm.group('file').strip())
+            for m in _PREINCLUDE_RE.finditer(line):
+                preincludes.append(
+                    m.group('a') or m.group('b') or m.group('c') or m.group('d'))
+
+    return {
+        "system_includes": _dedup(sysincs),
+        "preinclude_files": _dedup(preincludes),
+        "source_files": _dedup(sources),
+    }
+
+
+class DepParser:
+    """Locate and parse a target's Keil .dep, producing a DepEnrichment.
+
+    Degrades gracefully: missing/unreadable .dep -> found=False; a .dep older
+    than the .uvprojx -> found=True, stale=True (caller ignores its data).
+    """
+
+    def __init__(self, uvprojx_parser, dep_path_override=None):
+        self.p = uvprojx_parser
+        self.override = dep_path_override
+
+    def locate(self):
+        if self.override:
+            cand = Path(self.override)
+            return cand if cand.exists() else None
+        out_dir = self.p.get_output_dir()
+        name = "{0}_{1}.dep".format(self.p.project_name, self.p.get_target_name())
+        cand = (self.p.project_root / out_dir / name)
+        return cand if cand.exists() else None
+
+    def parse(self):
+        try:
+            dep_path = self.locate()
+            if dep_path is None:
+                return DepEnrichment(found=False)
+
+            uv_mtime = self.p.file_path.stat().st_mtime
+            dep_mtime = dep_path.stat().st_mtime
+            if uv_mtime > dep_mtime:
+                return DepEnrichment(found=True, stale=True, dep_path=dep_path)
+
+            raw = _parse_dep_text(dep_path.read_text(encoding="utf-8", errors="ignore"))
+            root = self.p.project_root
+            return DepEnrichment(
+                found=True,
+                stale=False,
+                dep_path=dep_path,
+                system_includes=[Path(s) for s in raw["system_includes"]],
+                preinclude_files=[(root / f).resolve() for f in raw["preinclude_files"]],
+                source_files=[(root / f).resolve() for f in raw["source_files"]],
+            )
+        except Exception as exc:  # never break the main flow
+            print("WARNING: .dep parse failed ({0}); using .uvprojx only.".format(exc))
+            return DepEnrichment(found=False)
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +530,13 @@ class ClangdGenerator:
         "-Wstrict-prototypes",
     ]
 
-    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None):
+    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
+                 enrichment=None):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+        self.enrichment = enrichment
 
     def generate(self):
         """Return the .clangd YAML string."""
@@ -456,6 +591,25 @@ class ClangdGenerator:
                     formatted = _format_path(ki, self.base_dir, self.use_absolute)
                     lines.append(f"    - -I{formatted}")
 
+        # .dep enrichment: system includes + forced preinclude macros
+        enr = self.enrichment
+        if enr and enr.found and not enr.stale:
+            existing = {ln.strip() for ln in lines}
+            if enr.system_includes:
+                lines.append("    # Compiler system headers (from .dep)")
+                for inc in enr.system_includes:
+                    formatted = _format_path(inc, self.base_dir, self.use_absolute)
+                    flag = f"    - -I{formatted}"
+                    if flag.strip() not in existing:
+                        lines.append(flag)
+                        existing.add(flag.strip())
+            if enr.preinclude_files:
+                lines.append("    # Preinclude headers (from .dep)")
+                for pf in enr.preinclude_files:
+                    formatted = _format_path(pf, self.base_dir, self.use_absolute)
+                    lines.append("    - -imacros")
+                    lines.append(f"    - {formatted}")
+
         # Remove flags
         lines.append("  Remove:")
         lines.append("    # Drop warning flags that are noisy for embedded code")
@@ -492,11 +646,13 @@ class ClangdGenerator:
 class CompileCommandsGenerator:
     """Generate compile_commands.json for clangd / IDE integration."""
 
-    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None):
+    def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
+                 enrichment=None):
         self.parser = parser
         self.keil = keil_resolver
         self.use_absolute = use_absolute
         self.base_dir = Path(base_dir).resolve() if base_dir else Path.cwd().resolve()
+        self.enrichment = enrichment
 
     def generate(self):
         """Return a list of compile-command entry dicts."""
@@ -506,6 +662,10 @@ class CompileCommandsGenerator:
         defines = self.parser.get_defines()
         include_paths = self.parser.get_include_paths()
         source_files = self.parser.get_source_files()
+        enr = self.enrichment
+        use_enr = bool(enr and enr.found and not enr.stale)
+        if use_enr and enr.source_files:
+            source_files = enr.source_files
 
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
         arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
@@ -542,15 +702,32 @@ class CompileCommandsGenerator:
                 formatted = _format_path(ki, self.base_dir, self.use_absolute)
                 base_args.append(f"-I{formatted}")
 
+        # .dep enrichment: compiler system includes (XML can't provide these)
+        if use_enr:
+            existing = {a for a in base_args if a.startswith("-I")}
+            for inc in enr.system_includes:
+                formatted = _format_path(inc, self.base_dir, self.use_absolute)
+                flag = f"-I{formatted}"
+                if flag not in existing:
+                    base_args.append(flag)
+                    existing.add(flag)
+
         compiler = "arm-none-eabi-gcc"
+
+        preinclude_args = []
+        if use_enr:
+            for pf in enr.preinclude_files:
+                formatted = _format_path(pf, self.base_dir, self.use_absolute)
+                preinclude_args += ["-imacros", formatted]
 
         entries = []
         for sf in source_files:
             file_str = _format_path(sf, self.base_dir, self.use_absolute)
-            command = f"{compiler} -c {file_str} " + " ".join(base_args)
+            file_args = base_args + preinclude_args
+            command = f"{compiler} -c {file_str} " + " ".join(file_args)
             entry = {
                 "command": command,
-                "arguments": [compiler, "-c", file_str] + base_args,
+                "arguments": [compiler, "-c", file_str] + file_args,
                 "directory": dir_str,
                 "file": file_str,
             }
@@ -691,6 +868,10 @@ def main():
                     help='Print info without writing any files')
     ap.add_argument('-o', '--output', default='.',
                     help='Output directory (default: current dir)')
+    ap.add_argument('--no-dep', action='store_true',
+                    help='Ignore Keil .dep build output; use .uvprojx only')
+    ap.add_argument('--dep-path', default=None,
+                    help='Explicit path to the target .dep file')
 
     args = ap.parse_args()
 
@@ -716,6 +897,23 @@ def main():
     # Always print macro / path check
     check_macros(parser, keil)
 
+    # Build .dep enrichment (ground-truth supplement; XML stays authoritative)
+    enrichment = DepEnrichment(found=False)
+    if not args.no_dep:
+        enrichment = DepParser(parser, dep_path_override=args.dep_path).parse()
+        if enrichment.found and not enrichment.stale:
+            print(f".dep: using {enrichment.dep_path} "
+                  f"(+{len(enrichment.system_includes)} sysinc, "
+                  f"+{len(enrichment.preinclude_files)} preinclude, "
+                  f"{len(enrichment.source_files)} files)")
+        elif enrichment.stale:
+            print(f".dep: STALE ({enrichment.dep_path} older than .uvprojx) — "
+                  f"ignored; rebuild the project to refresh system headers/preincludes.")
+        else:
+            print(".dep: not found — using .uvprojx only (no build output).")
+    else:
+        print(".dep: skipped (--no-dep).")
+
     if args.dry_run:
         print("--dry-run: no files written.")
         return 0
@@ -724,13 +922,15 @@ def main():
     if not args.no_clangd:
         gen = ClangdGenerator(parser, keil,
                               use_absolute=args.absolute,
-                              base_dir=output_dir)
+                              base_dir=output_dir,
+                              enrichment=enrichment)
         gen.write(output_dir)
 
     if not args.no_compile_commands:
         gen = CompileCommandsGenerator(parser, keil,
                                        use_absolute=args.absolute,
-                                       base_dir=output_dir)
+                                       base_dir=output_dir,
+                                       enrichment=enrichment)
         gen.write(output_dir)
 
     return 0
