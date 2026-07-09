@@ -3,3 +3,11 @@ __pycache__/
 .clangd
 compile_commands.json
 .keil2clangd.json
+
+# PyInstaller build artifacts
+scripts/build/
+scripts/dist/
+scripts/*.spec
+
+# SDD workflow scratch (briefs/reports/ledger)
+.superpowers/
