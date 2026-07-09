@@ -139,3 +139,105 @@ def reanchor_entries(entries, new_root, keil_root):
         if args_changed and 'command' in entry:
             entry['command'] = ' '.join(args)
     return changes, dead
+
+
+def _default_root():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path.cwd()
+
+
+def _backup(path):
+    shutil.copy2(str(path), str(path) + '.bak')
+
+
+def _report(name, changes, dead, dry_run):
+    tag = 'would rewrite' if dry_run else 'rewrote'
+    for old, new in _dedup([tuple(c) for c in changes]):
+        print("{0}: {1} {2} -> {3}".format(name, tag, old, new))
+    for p in _dedup(dead):
+        print("{0}: WARNING kept dead path {1} "
+              "(not found under new Keil; re-run the generator/skill)".format(name, p))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        description="Re-anchor .clangd / compile_commands.json after moving a project")
+    ap.add_argument('--root', default=None,
+                    help='Project root holding the files (default: exe dir / cwd)')
+    ap.add_argument('-k', '--keil-path', default=None,
+                    help='Keil installation path (skips auto-probe)')
+    ap.add_argument('--dry-run', action='store_true',
+                    help='Report changes without writing files')
+    ap.add_argument('--no-pause', action='store_true',
+                    help='Do not wait for Enter before exiting (frozen exe)')
+    args = ap.parse_args(argv)
+
+    root = Path(args.root).resolve() if args.root else _default_root()
+    new_root = str(root).replace('\\', '/')
+    clangd_path = root / '.clangd'
+    cc_path = root / 'compile_commands.json'
+
+    if not clangd_path.is_file() and not cc_path.is_file():
+        print("ERROR: neither .clangd nor compile_commands.json found in " + new_root)
+        return _finish(1, args)
+
+    clangd_text = None
+    entries = None
+    dead_found = []
+    if clangd_path.is_file():
+        with open(str(clangd_path), 'r', encoding='utf-8', newline='') as f:
+            clangd_text = f.read()
+        _, _, d = reanchor_clangd_text(clangd_text, None)   # scan: keil_root=None
+        dead_found += d
+    if cc_path.is_file():
+        with open(str(cc_path), 'r', encoding='utf-8') as f:
+            entries = json.load(f)
+        import copy
+        _, d = reanchor_entries(copy.deepcopy(entries), new_root, None)  # scan
+        dead_found += d
+
+    keil_root = None
+    if dead_found:
+        print("Dead toolchain paths detected:")
+        for p in _dedup(dead_found):
+            print("  " + p)
+        keil_root = KeilPathResolver(keil_path=args.keil_path).keil_root
+        if keil_root is None:
+            print("WARNING: Keil installation not found -- "
+                  "dead toolchain paths will be kept as-is.")
+
+    total = 0
+    if clangd_text is not None:
+        new_text, changes, dead = reanchor_clangd_text(clangd_text, keil_root)
+        if new_text != clangd_text and not args.dry_run:
+            _backup(clangd_path)
+            with open(str(clangd_path), 'w', encoding='utf-8', newline='') as f:
+                f.write(new_text)
+        _report('.clangd', changes, dead, args.dry_run)
+        total += len(_dedup([tuple(c) for c in changes]))
+    if entries is not None:
+        changes, dead = reanchor_entries(entries, new_root, keil_root)
+        if changes and not args.dry_run:
+            _backup(cc_path)
+            with open(str(cc_path), 'w', encoding='utf-8') as f:
+                json.dump(entries, f, indent=4, ensure_ascii=False)
+        _report('compile_commands.json', changes, dead, args.dry_run)
+        total += len(_dedup([tuple(c) for c in changes]))
+
+    print("\n{0}: {1} path(s).".format(
+        'Would change' if args.dry_run else 'Changed', total))
+    return _finish(0, args)
+
+
+def _finish(rc, args):
+    if getattr(sys, 'frozen', False) and not args.no_pause:
+        try:
+            input("\nPress Enter to exit...")
+        except EOFError:
+            pass
+    return rc
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
