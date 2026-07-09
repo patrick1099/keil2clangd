@@ -160,6 +160,11 @@ Behavior:
   skill to regenerate those entries.
 - Surgical by design: relative `-I`, `-D` macros, comments and AI-added lines
   survive byte-for-byte. Originals backed up to `*.bak`. `--dry-run` previews.
+- Out of scope: files generated with `-a`/`--absolute` (absolute paths for
+  everything), and project-local preinclude headers resolved to absolute paths,
+  encode a machine-specific project location that isn't under `/ARM/` -- the
+  re-anchor tool cannot recognize or fix those; they are kept as dead + warned.
+  Regenerate the skill's output instead of re-anchoring in that case.
 
 Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 
