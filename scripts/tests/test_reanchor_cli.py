@@ -115,6 +115,18 @@ class TestReanchorCli(unittest.TestCase):
         self.assertNotIn("Traceback", combined)
         self.assertIn("ERROR", combined)
 
+    def test_bom_prefixed_json_is_accepted(self):
+        # An editor (Notepad, PowerShell's Set-Content -Encoding utf8) can save a
+        # perfectly valid compile_commands.json with a UTF-8 BOM. Reading it as
+        # plain utf-8 would reject it; utf-8-sig accepts BOM and BOM-less alike.
+        cc = self.proj / "compile_commands.json"
+        cc.write_text(cc.read_text(encoding="utf-8"), encoding="utf-8-sig")
+        r = run_cli("--root", str(self.proj), "--keil-path", str(self.keil))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        entries = json.loads(cc.read_text(encoding="utf-8"))
+        self.assertEqual(entries[0]["directory"], self.new_root)
+        self.assertIn("-I" + self.new_inc, entries[0]["arguments"])
+
 
 class TestReanchorCliWriteFailure(unittest.TestCase):
     """compile_commands.json is read-only (simulates locked-by-editor / permission

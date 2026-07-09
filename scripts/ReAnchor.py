@@ -195,7 +195,8 @@ def main(argv=None):
             _, _, d = reanchor_clangd_text(clangd_text, None)   # scan: keil_root=None
             dead_found += d
         if cc_path.is_file():
-            with open(str(cc_path), 'r', encoding='utf-8') as f:
+            # utf-8-sig also accepts BOM-less files; an editor may have added one.
+            with open(str(cc_path), 'r', encoding='utf-8-sig') as f:
                 entries = json.load(f)
             if not isinstance(entries, list):
                 print("ERROR: compile_commands.json must be a JSON array (got {0})".format(
