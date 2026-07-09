@@ -2,8 +2,8 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "keil2clangd",
   "displayName": "Keil/IAR to clangd",
-  "version": "0.1.0",
-  "description": "从 Keil .uvprojx(或 IAR .ewp)工程生成并校验 .clangd + compile_commands.json,让 clangd 对嵌入式 C 工程做跳转/补全/诊断。skill 负责多 target 对比、跨 target 缺失宏检测与 ARMCC 扩展兼容,脚本负责机械解析。",
+  "version": "0.2.0",
+  "description": "从 Keil .uvprojx(或 IAR .ewp)工程生成并校验 .clangd + compile_commands.json,让 clangd 对嵌入式 C 工程做跳转/补全/诊断。skill 负责多 target 对比、跨 target 缺失宏检测与 ARMCC 扩展兼容,脚本负责机械解析。项目换目录或换电脑后,re-anchor 工具外科手术式修正失效路径,不动注释与手工增补。",
   "author": { "name": "xu" },
-  "keywords": ["keil", "clangd", "embedded", "compile-commands", "iar", "uvprojx"]
+  "keywords": ["keil", "clangd", "embedded", "compile-commands", "iar", "uvprojx", "re-anchor"]
 }
