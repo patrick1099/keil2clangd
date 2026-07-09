@@ -59,3 +59,41 @@ def fix_flag_value(path_str, keil_root):
     if new:
         return new, 'fixed'
     return None, 'dead'
+
+
+_CLANGD_I_RE = re.compile(r'^(\s*-\s+-I)(.*?)(\s*)$')
+_CLANGD_BARE_RE = re.compile(r'^(\s*-\s+)([^-#\s].*?)(\s*)$')
+
+
+def reanchor_clangd_text(text, keil_root):
+    """Line-level surgery on .clangd text. Returns (new_text, changes, dead).
+
+    Only -I values and the value line following '- -imacros' are candidates;
+    every other line is passed through untouched. CRLF endings survive because
+    the trailing-whitespace group captures the \r.
+    """
+    lines = text.split('\n')
+    changes = []
+    dead = []
+    expect_imacros_value = False
+    for i, line in enumerate(lines):
+        m = _CLANGD_I_RE.match(line)
+        if m:
+            expect_imacros_value = False
+        elif expect_imacros_value:
+            m = _CLANGD_BARE_RE.match(line)
+            expect_imacros_value = False
+            if not m:
+                continue
+        else:
+            if line.strip() == '- -imacros':
+                expect_imacros_value = True
+            continue
+        val = m.group(2)
+        new, status = fix_flag_value(val, keil_root)
+        if status == 'fixed':
+            lines[i] = m.group(1) + new + m.group(3)
+            changes.append((val, new))
+        elif status == 'dead':
+            dead.append(val)
+    return '\n'.join(lines), changes, dead
