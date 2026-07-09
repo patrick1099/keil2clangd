@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -92,6 +94,57 @@ class TestReanchorCli(unittest.TestCase):
         empty.mkdir()
         r = run_cli("--root", str(empty))
         self.assertEqual(r.returncode, 1)
+
+    def test_truncated_json_errors_cleanly(self):
+        # Malformed JSON must not crash past the exe's Enter-to-exit pause.
+        (self.proj / "compile_commands.json").write_text(
+            '[{"directory": "C:/x", "file"', encoding="utf-8")
+        r = run_cli("--root", str(self.proj))
+        self.assertEqual(r.returncode, 1)
+        combined = r.stdout + r.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertIn("ERROR", combined)
+
+    def test_object_shaped_json_errors_cleanly(self):
+        # Valid JSON that parses but is not a list (e.g. an accidentally-saved
+        # single object) must not reach entry.get('directory') on a str key.
+        (self.proj / "compile_commands.json").write_text("{}", encoding="utf-8")
+        r = run_cli("--root", str(self.proj))
+        self.assertEqual(r.returncode, 1)
+        combined = r.stdout + r.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertIn("ERROR", combined)
+
+
+class TestReanchorCliWriteFailure(unittest.TestCase):
+    """compile_commands.json is read-only (simulates locked-by-editor / permission
+    denied). _backup() succeeds (copy, not open-for-write of the original), then the
+    real write must fail cleanly through _finish() instead of a bare traceback."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.proj = Path(self.tmp.name) / "proj"
+        self.proj.mkdir()
+        # No absolute toolchain -I here: only the 'directory' mismatch triggers a
+        # write, so no Keil auto-probe (and no stdin interaction) is involved.
+        entries = [{"command": "arm-none-eabi-gcc -c App/main.c -IApp/Code",
+                    "arguments": ["arm-none-eabi-gcc", "-c", "App/main.c", "-IApp/Code"],
+                    "directory": "C:/Old/Dir", "file": "App/main.c"}]
+        self.cc_path = self.proj / "compile_commands.json"
+        self.cc_path.write_text(json.dumps(entries, indent=4), encoding="utf-8")
+        os.chmod(str(self.cc_path), stat.S_IREAD)
+
+    def tearDown(self):
+        os.chmod(str(self.cc_path), stat.S_IWRITE)
+        self.tmp.cleanup()
+
+    def test_write_failure_returns_error_and_keeps_backup(self):
+        r = run_cli("--root", str(self.proj))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        combined = r.stdout + r.stderr
+        self.assertNotIn("Traceback", combined)
+        self.assertIn("ERROR", combined)
+        self.assertTrue((self.proj / "compile_commands.json.bak").exists())
 
 
 if __name__ == "__main__":
