@@ -131,6 +131,38 @@ Tell the user:
 - Any remaining warnings that need manual attention
 - Instruct to restart clangd: Ctrl+Shift+P -> "clangd: Restart language server"
 
+## Project moved / new machine (re-anchor)
+
+Generated files contain machine/location-bound paths. Measured behavior (clangd 22, Windows):
+
+1. `compile_commands.json`'s `directory` MUST be a correct absolute path on the
+   current machine — a relative value never works (clangd hard limit), and a stale
+   absolute value only works while clangd's CWD happens to be the project root.
+2. Relative `-I` in `.clangd` resolve against that `directory` anchor.
+3. Absolute toolchain `-I` (e.g. `C:/Keil_v5/...`) break across machines
+   (different drive/version) — only re-probing can fix them.
+
+Run the re-anchor tool after moving the project (same machine) or copying it to
+another machine:
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <project_root>
+# or double-click keil2clangd-reanchor.exe placed next to .clangd (build:
+# scripts/build_exe.bat; no Python/plugin needed on the target machine)
+```
+
+Behavior:
+- Same machine, moved folder: fully automatic — rewrites `directory`, leaves
+  everything else untouched.
+- New machine: probes Keil (`KEIL_PATH` -> `~/.keil2clangd.json` -> common
+  locations -> interactive prompt, answer saved) and rewrites dead toolchain
+  `-I`/`-imacros`. Pack-version mismatches are kept + warned — re-run this
+  skill to regenerate those entries.
+- Surgical by design: relative `-I`, `-D` macros, comments and AI-added lines
+  survive byte-for-byte. Originals backed up to `*.bak`. `--dry-run` previews.
+
+Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
+
 ## Common issues the script can't handle
 
 | Issue | Symptom | Fix |
