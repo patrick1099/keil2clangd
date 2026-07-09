@@ -33,6 +33,16 @@ skills/keil2clangd/SKILL.md      skill(流程 + 校验)
 scripts/                         Keil2Clangd.py / Ewp2Json.py / Keil2Json.py
 ```
 
+## 工程搬家 / 换机(re-anchor)
+
+生成的 `.clangd`/`compile_commands.json` 含机器/路径绑定信息,工程挪目录或换机后会失效。`scripts/ReAnchor.py` 只做外科手术式修复:重写 `directory` 和失效的绝对路径 toolchain `-I`/`-imacros`,相对 `-I`、`-D` 宏、注释和人工/AI 加的行原样保留。详见 `skills/keil2clangd/SKILL.md` 的 "Project moved / new machine" 一节。
+
+```bash
+py -3 scripts/ReAnchor.py --root <project_root>
+```
+
+同机搬家全自动;换机会探测 Keil 安装位置后重写死路径。也可用 `scripts/build_exe.bat` 打包成 `keil2clangd-reanchor.exe`,放到 `.clangd` 旁双击运行,目标机器不需要 Python/插件。
+
 ## 致谢
 
 解析脚本源自 [huiyi-li/keil2clangd](https://github.com/huiyi-li/keil2clangd),本仓库在其基础上打包为 Claude Code 插件并补充了 skill 校验流程。`.dep` 解析思路参考 [vankubo/uvConvertor](https://github.com/vankubo/uvConvertor) 与 [a3750/uvconvertor](https://github.com/a3750/uvconvertor)。许可证见 `LICENSE`。
