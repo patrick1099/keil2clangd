@@ -97,3 +97,45 @@ def reanchor_clangd_text(text, keil_root):
         elif status == 'dead':
             dead.append(val)
     return '\n'.join(lines), changes, dead
+
+
+def reanchor_entries(entries, new_root, keil_root):
+    """Mutate compile-command entries in place. Returns (changes, dead).
+
+    Rewrites 'directory' to new_root and fixes dead toolchain -I/-imacros in
+    'arguments'. 'command' is rebuilt as ' '.join(arguments) only when an
+    argument actually changed, so hand-edited commands survive a pure
+    directory re-anchor.
+    """
+    changes = []
+    dead = []
+    for entry in entries:
+        args_changed = False
+        old_dir = entry.get('directory')
+        if old_dir != new_root:
+            entry['directory'] = new_root
+            changes.append((old_dir, new_root))
+        args = entry.get('arguments')
+        if not args:
+            continue
+        i = 0
+        while i < len(args):
+            a = args[i]
+            val = prefix = None
+            if a.startswith('-I'):
+                val, prefix, at = a[2:], '-I', i
+            elif a == '-imacros' and i + 1 < len(args):
+                i += 1
+                val, prefix, at = args[i], '', i
+            if val is not None:
+                new, status = fix_flag_value(val, keil_root)
+                if status == 'fixed':
+                    args[at] = prefix + new
+                    changes.append((val, new))
+                    args_changed = True
+                elif status == 'dead':
+                    dead.append(val)
+            i += 1
+        if args_changed and 'command' in entry:
+            entry['command'] = ' '.join(args)
+    return changes, dead
