@@ -186,6 +186,15 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <project_root>
 # scripts/build_exe.bat; no Python/plugin needed on the target machine)
 ```
 
+**Ship the exe INSIDE the project (commit it).** The whole point of the exe is
+that it runs on machines with no Python and no plugin, so it must travel *with*
+the project. When you finish generating for a project, copy
+`scripts/dist/keil2clangd-reanchor.exe` next to the generated config (e.g. into
+the `Proj/` dir alongside `compile_commands.json`) and commit it, so whoever
+clones/copies the project to a new machine can just double-click it to re-anchor.
+It fixes machine-bound *paths* only — it does NOT fix the config-*discovery*
+placement issue in step 5b (that's a one-time fix, not per-machine).
+
 Behavior:
 - Same machine, moved folder: fully automatic — rewrites `directory`, leaves
   everything else untouched.
