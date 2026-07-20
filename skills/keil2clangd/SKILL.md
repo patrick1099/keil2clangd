@@ -110,6 +110,41 @@ For each `-I` path in `.clangd`:
 - Verify `directory` field is correct
 - Check includes and defines are consistent with `.clangd`
 
+### 5b. Verify clangd can DISCOVER the config (placement — CRITICAL)
+
+Validating content is not enough: clangd must be able to *find* the files.
+**clangd searches a source file's own directory and its ANCESTOR directories
+only — never sibling directories.** So both `.clangd` and `compile_commands.json`
+must sit on an ancestor path of the source files.
+
+The trap: `-o .` usually writes output into the `.uvprojx`/`Proj` folder, but
+sources often live in a *sibling* dir (e.g. entries read `../Code/main.c`, so
+sources are in `Proj/../Code` = `App/Code`, while output is in `App/Proj`).
+`Proj` is a sibling of `Code`, not an ancestor — so clangd never discovers the
+database. Symptom is deceptive: **same-file navigation still works, but
+cross-file jump-to-definition and find-references silently fail** (those need
+the background index, which needs the database).
+
+Check:
+1. Take the `directory` field + a `file` entry from `compile_commands.json`,
+   resolve to the source's real absolute dir (e.g. `App/Code`).
+2. Confirm the output dir (where you wrote the files) is that dir or an ancestor
+   of it. If the output dir is a *sibling* (or otherwise off the ancestor path),
+   clangd will not find it.
+
+Fix (don't move the big generated file — drop a pointer): create a small
+`.clangd` on the sources' nearest ancestor dir containing:
+```yaml
+CompileFlags:
+  CompilationDatabase: <relative-path-from-here-to-the-dir-with-compile_commands.json>
+```
+e.g. a `.clangd` in `App/` with `CompilationDatabase: Proj`. Put it at the
+tightest ancestor that covers the sources but not unrelated sibling projects
+(e.g. `App/`, not the repo root, so a separate `Boot/` project is unaffected).
+Copy the `Diagnostics`/`ClangTidy` blocks from the generated `.clangd` into this
+pointer file too, since the generated one in the sibling dir won't be seen for
+those sources either.
+
 ### 6. Fix issues found
 
 For any problems discovered in steps 3-5:
@@ -180,6 +215,7 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 | Cross-drive paths (C: vs D:) | Relative path fails | Script handles this, but verify |
 | Keil not found on new machine | Prompted for path on first run | Enter path, auto-saved to `~/.keil2clangd.json` |
 | Wrong CMSIS version selected | Include path points to wrong version | Script reads .pdsc for version hint; verify in output |
+| Output dir is a sibling of the sources (not an ancestor) | Same-file jump works, but cross-file jump-to-def / find-references silently fail | clangd only searches ancestor dirs. Drop a pointer `.clangd` on the sources' ancestor with `CompileFlags.CompilationDatabase: <dir>` (see step 5b) |
 
 ## Script location
 
