@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Shared building blocks for the keil2clangd backends.
+
+Every backend (Keil .uvprojx, IAR .ewp, CMake) parses a different project
+format but emits the same two artifacts, so the emission side lives here:
+
+  * ``~/.keil2clangd.json`` access (Keil path, IAR path, probe caches)
+  * path formatting (relative-to-anchor vs absolute, forward slashes)
+  * ``.clangd`` document rendering
+  * ``compile_commands.json`` entry construction and writing
+  * the config-*discovery* placement check (clangd only searches ancestor
+    directories, never siblings) plus the pointer-``.clangd`` fix for it
+
+Nothing in here knows about a specific project file format.
+"""
+
+import json
+import os
+from pathlib import Path
+
+
+CONFIG_FILE = Path.home() / '.keil2clangd.json'
+
+
+# ---------------------------------------------------------------------------
+# ~/.keil2clangd.json
+# ---------------------------------------------------------------------------
+
+def load_config():
+    """Return the user config dict, or {} if absent/unreadable."""
+    if CONFIG_FILE.is_file():
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_config(config):
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+
+
+def config_get(key, default=None):
+    return load_config().get(key, default)
+
+
+def config_set(key, value):
+    config = load_config()
+    config[key] = value
+    save_config(config)
+
+
+# ---------------------------------------------------------------------------
+# Path formatting
+# ---------------------------------------------------------------------------
+
+def format_path(abs_path, base_dir, use_absolute=False):
+    """Format a path relative to ``base_dir`` (or absolute), forward slashes.
+
+    Falls back to absolute when the two live on different Windows drives,
+    where no relative path exists.
+    """
+    abs_path = Path(abs_path).resolve()
+    if use_absolute:
+        return str(abs_path).replace('\\', '/')
+    try:
+        return os.path.relpath(str(abs_path), str(base_dir)).replace('\\', '/')
+    except ValueError:
+        return str(abs_path).replace('\\', '/')
+
+
+# ---------------------------------------------------------------------------
+# .clangd rendering
+# ---------------------------------------------------------------------------
+
+CLANG_TIDY_ADD = [
+    "bugprone-*",
+    "readability-*",
+    "performance-*",
+]
+
+CLANG_TIDY_REMOVE = [
+    "readability-magic-numbers",
+    "readability-identifier-length",
+    "bugprone-easily-swappable-parameters",
+    "performance-no-int-to-ptr",
+]
+
+DIAGNOSTICS_SUPPRESS = [
+    "-Wunused-parameter",
+    "-Wmissing-prototypes",
+    "-Wstrict-prototypes",
+]
+
+REMOVE_FLAGS = [
+    "-W*",
+    "-pedantic",
+]
+
+
+def render_diagnostics(suppress=None, tidy_add=None, tidy_remove=None):
+    """Render the ``Diagnostics:`` block as a list of lines."""
+    suppress = DIAGNOSTICS_SUPPRESS if suppress is None else suppress
+    tidy_add = CLANG_TIDY_ADD if tidy_add is None else tidy_add
+    tidy_remove = CLANG_TIDY_REMOVE if tidy_remove is None else tidy_remove
+
+    lines = ["Diagnostics:", "  Suppress:"]
+    lines += ["    - {0}".format(s) for s in suppress]
+    lines += ["  ClangTidy:", "    Add:"]
+    lines += ["      - {0}".format(a) for a in tidy_add]
+    lines += ["    Remove:"]
+    lines += ["      - {0}".format(r) for r in tidy_remove]
+    return lines
+
+
+class ClangdDoc:
+    """Accumulate CompileFlags groups and render a ``.clangd`` document.
+
+    Flags are added in labelled groups so the generated file stays readable
+    and a human can tell which backend stage produced which flag.
+    """
+
+    def __init__(self):
+        self._groups = []          # list of (comment_or_None, [flag, ...])
+        self._seen = set()
+        self._remove = list(REMOVE_FLAGS)
+        self._remove_comment = "Drop warning flags that are noisy for embedded code"
+        self._diagnostics = None   # None -> defaults
+
+    def add_group(self, comment, flags, allow_duplicates=False):
+        """Append a labelled flag group, dropping flags already emitted.
+
+        ``allow_duplicates`` is for groups where a repeated token is meaningful
+        rather than redundant -- two ``-imacros`` headers need two ``-imacros``
+        tokens, and deduplicating them would silently drop the second header.
+        """
+        if allow_duplicates:
+            fresh = list(flags)
+            self._seen.update(fresh)
+        else:
+            fresh = []
+            for flag in flags:
+                if flag in self._seen:
+                    continue
+                self._seen.add(flag)
+                fresh.append(flag)
+        if fresh:
+            self._groups.append((comment, fresh))
+        return self
+
+    def has_flag(self, flag):
+        return flag in self._seen
+
+    def set_remove(self, flags, comment=None):
+        self._remove = list(flags)
+        if comment is not None:
+            self._remove_comment = comment
+        return self
+
+    def set_diagnostics(self, suppress=None, tidy_add=None, tidy_remove=None):
+        self._diagnostics = (suppress, tidy_add, tidy_remove)
+        return self
+
+    def render(self):
+        lines = ["CompileFlags:", "  Add:"]
+        for comment, flags in self._groups:
+            if comment:
+                lines.append("    # {0}".format(comment))
+            lines += ["    - {0}".format(f) for f in flags]
+
+        lines.append("  Remove:")
+        if self._remove_comment:
+            lines.append("    # {0}".format(self._remove_comment))
+        lines += ["    - {0}".format(f) for f in self._remove]
+
+        lines.append("")
+        if self._diagnostics is None:
+            lines += render_diagnostics()
+        else:
+            lines += render_diagnostics(*self._diagnostics)
+        return '\n'.join(lines) + '\n'
+
+    def write(self, output_dir):
+        out = Path(output_dir) / '.clangd'
+        out.write_text(self.render(), encoding='utf-8')
+        print("Generated: {0}".format(out))
+        return out
+
+
+# ---------------------------------------------------------------------------
+# compile_commands.json
+# ---------------------------------------------------------------------------
+
+def _shell_quote(arg):
+    """Quote an argument for the ``command`` string only.
+
+    ``arguments`` is the authoritative, already-split form; ``command`` is a
+    single string that a reader may re-split on whitespace, so any argument
+    holding a space (toolchain paths under "Program Files", say) has to be
+    quoted or it silently becomes two arguments.
+    """
+    if arg and not any(c in arg for c in ' \t"'):
+        return arg
+    return '"{0}"'.format(arg.replace('"', '\\"'))
+
+
+def make_compile_entries(compiler, base_args, source_files, base_dir,
+                         use_absolute=False):
+    """Build compile-command entries, one per source file."""
+    dir_str = str(Path(base_dir).resolve()).replace('\\', '/')
+    entries = []
+    for source in source_files:
+        file_str = format_path(source, base_dir, use_absolute)
+        command = "{0} -c {1} {2}".format(
+            _shell_quote(compiler), _shell_quote(file_str),
+            " ".join(_shell_quote(a) for a in base_args))
+        entries.append({
+            "command": command,
+            "arguments": [compiler, "-c", file_str] + list(base_args),
+            "directory": dir_str,
+            "file": file_str,
+        })
+    return entries
+
+
+def write_compile_commands(entries, output_dir):
+    out = Path(output_dir) / 'compile_commands.json'
+    with open(str(out), 'w', encoding='utf-8') as f:
+        json.dump(entries, f, indent=4, ensure_ascii=False)
+    print("Generated: {0}  ({1} entries)".format(out, len(entries)))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Config-discovery placement
+# ---------------------------------------------------------------------------
+
+def _is_ancestor(ancestor, descendant):
+    ancestor = Path(ancestor).resolve()
+    descendant = Path(descendant).resolve()
+    try:
+        descendant.relative_to(ancestor)
+        return True
+    except ValueError:
+        return False
+
+
+def common_ancestor(paths):
+    """Deepest directory that contains every given path, or None."""
+    dirs = []
+    for p in paths:
+        p = Path(p).resolve()
+        dirs.append(p if p.is_dir() else p.parent)
+    if not dirs:
+        return None
+    try:
+        return Path(os.path.commonpath([str(d) for d in dirs]))
+    except ValueError:
+        # different drives
+        return None
+
+
+class PlacementReport:
+    """Result of checking whether clangd can *discover* the generated config.
+
+    clangd searches a source file's own directory and its ancestors only --
+    never siblings. When the output dir is a sibling of the sources, same-file
+    navigation still works but cross-file jump-to-definition silently fails.
+    """
+
+    def __init__(self, output_dir, unreachable, anchor):
+        self.output_dir = Path(output_dir).resolve()
+        self.unreachable = unreachable      # source files clangd cannot reach
+        self.anchor = anchor                # where a pointer .clangd should go
+
+    @property
+    def ok(self):
+        return not self.unreachable
+
+    def describe(self):
+        if self.ok:
+            return "placement: OK -- output dir is an ancestor of all sources."
+        lines = [
+            "placement: PROBLEM -- {0} source file(s) are NOT under the output dir."
+            .format(len(self.unreachable)),
+            "  output dir: {0}".format(self.output_dir),
+            "  example:    {0}".format(self.unreachable[0]),
+            "  clangd only searches a file's own dir and its ANCESTORS, so it will",
+            "  never find this database. Same-file jumps keep working; cross-file",
+            "  jump-to-definition and find-references silently fail.",
+        ]
+        if self.anchor:
+            lines.append("  fix: drop a pointer .clangd in {0}".format(self.anchor))
+        return '\n'.join(lines)
+
+
+def check_placement(output_dir, source_files):
+    """Check that ``output_dir`` is on the ancestor path of every source."""
+    output_dir = Path(output_dir).resolve()
+    unreachable = [Path(s).resolve() for s in source_files
+                   if not _is_ancestor(output_dir, s)]
+    anchor = None
+    if unreachable:
+        # The pointer .clangd must sit above the sources; it does NOT need to
+        # contain the output dir, so folding that in would only push the anchor
+        # needlessly shallow (often all the way to the drive root).
+        anchor = common_ancestor(source_files)
+    return PlacementReport(output_dir, unreachable, anchor)
+
+
+def render_pointer_clangd(database_dir, anchor_dir, suppress=None,
+                          tidy_add=None, tidy_remove=None):
+    """Render a small ``.clangd`` that points clangd at a database elsewhere.
+
+    The generated file carries the Diagnostics blocks too: the real ``.clangd``
+    sits in a directory clangd will never read for these sources, so its
+    diagnostics settings would otherwise be lost.
+    """
+    rel = format_path(database_dir, anchor_dir, use_absolute=False)
+    lines = [
+        "# Generated by keil2clangd.",
+        "# The real compile_commands.json lives in a sibling directory, which",
+        "# clangd never searches. This pointer makes it discoverable.",
+        "CompileFlags:",
+        "  CompilationDatabase: {0}".format(rel),
+        "",
+    ]
+    lines += render_diagnostics(suppress, tidy_add, tidy_remove)
+    return '\n'.join(lines) + '\n'
+
+
+def write_pointer_clangd(database_dir, anchor_dir, **kwargs):
+    out = Path(anchor_dir) / '.clangd'
+    out.write_text(render_pointer_clangd(database_dir, anchor_dir, **kwargs),
+                   encoding='utf-8')
+    print("Generated: {0}  (pointer to {1})".format(out, database_dir))
+    return out
