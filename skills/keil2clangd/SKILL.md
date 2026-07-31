@@ -1,57 +1,70 @@
 ---
 name: keil2clangd
-description: Generate and validate .clangd + compile_commands.json from Keil .uvprojx (or IAR .ewp) project files for embedded C projects. Use when setting up clangd-based jump/completion/diagnostics for a Keil MDK or IAR firmware project, or when clangd reports missing macros / include paths / ARMCC syntax errors.
+description: Generate and validate .clangd + compile_commands.json for embedded C projects from Keil .uvprojx, IAR .ewp (any architecture — ICCARM, ICCRL78, ICCRX, ICC430), or CMake. Use when setting up clangd-based jump/completion/diagnostics for a firmware project, when clangd reports missing macros / include paths / vendor-extension syntax errors, or when cross-file jump-to-definition silently fails while same-file navigation works.
 ---
 
-# Keil to Clangd Configuration Generator
+# Project to clangd Configuration Generator
 
-Generate `.clangd` and `compile_commands.json` from a Keil `.uvprojx` project file, then validate the output and fix issues the script can't handle.
+Generate `.clangd` and `compile_commands.json` for an embedded C project, then
+validate the output and fix what the scripts cannot.
 
-The bundled script is at `${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py` (IAR variant: `Ewp2Json.py`; legacy JSON-only: `Keil2Json.py`). Run it with `py -3` (Windows) or `python3`.
+## Pick a backend
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Proj2Clangd.py" -p <dir> --detect-only
+```
+
+`Proj2Clangd.py` detects the project type and forwards every other argument to
+the matching backend. The backends also run standalone:
+
+| Project | Detected by | Backend | What it does |
+|---|---|---|---|
+| Keil MDK | `*.uvprojx` | `Keil2Clangd.py` | Parses XML + `.dep`, synthesises all flags |
+| IAR EW | `*.ewp` | `Iar2Clangd.py` | Parses XML, **probes the real IAR compiler** for macros |
+| CMake | `CMakeLists.txt` | `Cmake2Clangd.py` | Runs configure, then makes CMake's own database discoverable |
+
+If a tree holds more than one, `Proj2Clangd.py` refuses to guess — pass
+`--kind keil|iar|cmake`.
+
+---
+
+# Keil (.uvprojx)
 
 ## Keil path configuration
 
-The script persists the Keil installation path to `~/.keil2clangd.json`. Discovery priority:
-1. `-k` / `--keil-path` CLI argument
-2. `KEIL_PATH` environment variable
-3. `~/.keil2clangd.json` (auto-saved on first discovery)
-4. Fallback scan of common locations (`D:/Keil_v5`, `C:/Keil_v5`, `C:/Keil`)
-5. Interactive prompt (saves to config file)
-
-If Keil is found automatically or entered interactively, the path is saved so future runs on any project reuse it without re-entering.
+The script persists the Keil installation path to `~/.keil2clangd.json`.
+Discovery priority: `-k`/`--keil-path` → `KEIL_PATH` → `~/.keil2clangd.json` →
+scan of `D:/Keil_v5`, `C:/Keil_v5`, `C:/Keil` → interactive prompt (saved).
 
 ## CMSIS version selection
 
-The script parses the device pack's `.pdsc` file for CMSIS version requirements. If a hint is found, it selects the closest installed version >= that requirement. Otherwise falls back to the latest installed version.
+The script parses the device pack's `.pdsc` for CMSIS version requirements and
+picks the closest installed version ≥ that. Otherwise the latest installed.
 
 ## Steps
 
-### 1. Find the uvprojx file and analyze ALL targets
+### 1. Find the uvprojx and analyze ALL targets
 
 ```
 Glob: **/*.uvprojx
 ```
 
-If multiple uvprojx found, ask the user which one to use.
+If multiple are found, ask which one. Then read the XML and extract every
+target's configuration — for each `<Target>`: `<TargetName>`,
+`TargetArmAds/Cads/VariousControls/Define`, and `.../IncludePath`.
 
-**Then read the uvprojx XML and extract EVERY target's configuration:**
-
-For each `<Target>` element in the XML:
-- `<TargetName>` — target name
-- `TargetArmAds/Cads/VariousControls/Define` — that target's macros
-- `TargetArmAds/Cads/VariousControls/IncludePath` — that target's include paths
-
-**Present a comparison table to the user**, like:
+**Present a comparison table:**
 
 | Target | Macros | Include path differences |
 |--------|--------|------------------------|
 | Iot-CSB-Debug_G048 | `__DEBUG, __G048` | `bsp/G048/...` |
-| Iot-CSB-Debug_LG048 | `USE_FULL_ASSERT, __DEBUG` | `bsp/LG048/...` |
 | Iot-CSB-Release_LG048 | `__CODE_IAP, __LG048` | `bsp/LG048/...` |
 
-**Key point:** Different targets often have different chip variant macros (e.g. `__G048` vs `__LG048`), feature flags (`__CODE_IAP`, `USE_FULL_ASSERT`), and BSP paths. The target name often hints at which chip/variant it's for — use this to identify which macros the user actually needs.
-
-Ask the user which target to generate for. If the target name contains a chip variant (e.g. `LG048` in `Iot-CSB-Debug_LG048`) but the target's macros don't include the corresponding define (e.g. missing `__LG048`), **check other targets for that macro and warn the user**. This is a common Keil misconfiguration — the macro may need to be added manually.
+**Key point:** targets often differ in chip-variant macros (`__G048` vs
+`__LG048`), feature flags (`__CODE_IAP`, `USE_FULL_ASSERT`) and BSP paths. Ask
+which target to generate for. If the target name contains a variant (`LG048`)
+but its macros lack the matching define (`__LG048`), **check other targets and
+warn** — that is a common Keil misconfiguration.
 
 ### 2. Run the script
 
@@ -59,198 +72,337 @@ Ask the user which target to generate for. If the target name contains a chip va
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> -o . -t <target_name>
 ```
 
-Review the macro check output carefully. Flag any warnings to the user:
-- Empty project macros
-- MISSING include paths
-- Keil installation not found (if not in `~/.keil2clangd.json` and not auto-detected)
+Flag any warnings: empty project macros, MISSING include paths, Keil not found.
 
 ### 2b. Understand the two data sources (.uvprojx vs .dep)
 
-- **`.uvprojx` (XML)** is the live source of truth for **macros (`-D`) and project include paths (`-I`)** — edit a macro in Keil and it takes effect immediately, no build needed.
-- **`.dep`** is generated by Keil **after a build** and supplies only what XML can't: compiler **system headers**, **preinclude** headers (`-imacros`), and the **real compiled file list**. The script uses it automatically when fresh.
-- **Staleness guard:** if `.uvprojx` is newer than `.dep`, the script prints `.dep: STALE ... ignored` and falls back to XML-only. If you changed macros, that's expected — rebuild the project (or ignore, since macros already come from XML).
-- Read the script's `.dep:` log line to know which source was used. Use `--no-dep` to force XML-only, `--dep-path` for a non-standard output dir.
+- **`.uvprojx` (XML)** is the live source of truth for **macros (`-D`) and
+  project include paths (`-I`)** — edit in Keil and it takes effect at once.
+- **`.dep`** is written by Keil **after a build** and supplies only what XML
+  cannot: compiler **system headers**, **preinclude** headers (`-imacros`), and
+  the **real compiled file list**. Used automatically when fresh.
+- **Staleness guard:** if `.uvprojx` is newer than `.dep`, the script prints
+  `.dep: STALE ... ignored` and falls back to XML-only. Expected after a macro
+  edit — rebuild, or ignore since macros come from XML anyway.
+- Read the `.dep:` log line. `--no-dep` forces XML-only, `--dep-path` points at
+  a non-standard output dir.
 
 ### 3. Validate macros (CRITICAL)
 
-Read the generated `.clangd` and cross-check macros:
+**3a. Cross-target macro analysis** — collect macros from ALL targets, find any
+present in others but not the selected one, and check whether the codebase uses
+them via `#ifdef`/`#if defined`/`#ifndef`. Pay special attention to chip-variant
+macros.
 
-**3a. Cross-target macro analysis:**
-- Collect macros from ALL targets in the uvprojx
-- Identify macros that appear in OTHER targets but not the selected one
-- For each missing macro, check if source code uses it via `#ifdef`/`#if defined`/`#ifndef`
-- If a macro from another target is used in the codebase, it's likely needed — ask user whether to add it
-- Pay special attention to chip variant macros: if target name says `LG048` but macros don't include `__LG048`, check Release or other targets for it
+**3b. Project macros** — every `Define` in the selected target's XML must appear
+as `-D` in `.clangd`.
 
-**3b. Project macros from selected target:**
-- Read the `.uvprojx` XML, find the selected target's `VariousControls/Define`
-- Every define must appear as `-D` in `.clangd`
+**3c. Compiler macros (auto-added)** — ARMCC v5 (uAC6=0) needs `__CC_ARM`,
+`__arm__`, arch define; ARM Clang v6 (uAC6=1) needs `__ARMCC_VERSION=6000000`,
+`__arm__`, arch define. Arch must match CPU: M0 → `__ARM_ARCH_6M__`,
+M3 → `__ARM_ARCH_7M__`, M4/M7 → `__ARM_ARCH_7EM__`.
 
-**3c. Compiler macros (auto-added by script):**
-- ARMCC v5 (uAC6=0): must have `__CC_ARM`, `__arm__`, arch define
-- ARM Clang v6 (uAC6=1): must have `__ARMCC_VERSION=6000000`, `__arm__`, arch define
-- Arch define must match CPU: Cortex-M0 -> `__ARM_ARCH_6M__`, M3 -> `__ARM_ARCH_7M__`, M4/M7 -> `__ARM_ARCH_7EM__`
-
-**3d. Hidden macros not in any target:**
-- Grep source files for `#ifdef` / `#if defined` / `#ifndef` patterns
-- Cross-reference found macros against ALL targets' defines + compiler auto-macros
-- If unresolved macros found, list them and ask the user which ones to add
+**3d. Hidden macros** — grep for `#ifdef`/`#if defined`/`#ifndef`, cross-check
+against all targets plus auto-macros, list unresolved ones and ask.
 
 ### 4. Validate include paths
 
-For each `-I` path in `.clangd`:
-- Check the path exists on disk using Glob or Bash
-- If MISSING: warn and suggest alternatives
-- For Keil Pack paths: if version mismatch, scan `{keil}/ARM/PACK/{vendor}/{pack}/` for installed versions
-- Also validate system headers and preinclude paths supplied by `.dep` if used
+Check each `-I` exists. For Keil Pack paths, if the version mismatches, scan
+`{keil}/ARM/PACK/{vendor}/{pack}/` for installed versions.
 
 ### 5. Validate compile_commands.json
 
-- Check each source file in `compile_commands.json` exists
-- Verify `directory` field is correct
-- Check includes and defines are consistent with `.clangd`
+Check each source exists, `directory` is correct, and includes/defines agree
+with `.clangd`.
 
-### 5b. Verify clangd can DISCOVER the config (placement — CRITICAL)
+---
+
+# IAR (.ewp)
+
+Works with **any** IAR architecture. The compiler settings node is found by its
+`ICC` prefix, so ICCARM, ICCRL78, ICCRX, ICC430 and friends all parse.
+
+> The retired `Ewp2Json.py` matched a node named literally `ICCARM`. On any
+> other architecture it parsed zero macros and zero include paths and still
+> emitted a full compile_commands.json, so the output looked fine and was
+> useless. It now forwards here.
+
+## What makes the IAR backend different: it asks the compiler
+
+Instead of hard-coding a macro table, the script runs the installed
+`icc<arch>.exe` with `--predef_macros` and writes the result into a generated
+preinclude header, wired up with `-imacros`. The macro set therefore always
+matches the installed compiler version and options (300+ macros for RL78,
+including `__ICCRL78__`, `__CORE__`, `__DATA_MODEL__`).
+
+Things derived from that probe rather than guessed:
+
+- **char signedness** — read from `__CHAR_MIN__`, emitted as
+  `-funsigned-char`/`-fsigned-char`.
+- **`--target` triple** — chosen by `__DEF_PTR_SIZE__`. A target is always
+  emitted: with none, clang falls back to the host triple, and on Windows that
+  is an MSVC triple whose predeclared `size_t` collides with IAR's target-sized
+  one. Architectures clang has no backend for (RL78, RX, STM8) get a
+  size-matched stand-in, and the stand-in's identity macros (`__MSP430__`, …)
+  plus clang's own (`__GNUC__`, `__clang__`) are `#undef`'d in the generated
+  header so code testing them is not fooled.
+- **`--core`** — see below.
+
+## Core negotiation
+
+`.ewp` stores only the IDE dropdown *index* (`IccCore`), whose meaning varies by
+architecture and workbench version. Instead of mapping it, the script uses the
+compiler as the oracle: it compiles a TU that includes the project's device
+header (derived from `GenDeviceSelect`, e.g. `R5F10WMG` → `ior5f10wmg.h`), first
+with default options and then with each candidate core, keeping whichever is
+accepted. Candidates come from the probe's own `__<ARCH>_<n>__` macros.
+
+Getting this wrong is not subtle — device headers carry
+`#error "... for use with ICCRL78 option --core rl78_1 only"`. Disable with
+`--no-core-probe`, override with `--probe-args "--core s2"`.
+
+## Extended keywords
+
+`__near`, `__saddr`, `__interrupt`, `__no_init`, `__root`, … are language
+extensions, not macros, so they never appear in `--predef_macros`. The generated
+header shims them (`__weak` → `__attribute__((weak))`, most to nothing).
+
+## Steps
+
+### 1. List the build configurations
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Iar2Clangd.py" -p <dir> --list-configs
+```
+
+Configurations usually differ in macros the same way Keil targets do (`Debug` =
+`_CODE_DEBUG_` vs `Releas_004` = `DEF_004`). Ask which one; the script also
+prints a cross-configuration table and warns about macros present elsewhere but
+not in the selected configuration.
+
+### 2. Run
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Iar2Clangd.py" -p <dir> -o <output_dir> -c <configuration>
+```
+
+Review the report: unresolved `$VAR$` in include paths, MISSING directories,
+whether the probe succeeded, which core was negotiated, which triple was picked.
+
+### 3. Validate
+
+Same as the Keil steps 3–5, plus:
+
+- `-nostdinc` is emitted whenever IAR's own headers were found, so the standard
+  library comes from the toolchain rather than the host. If IAR is **not**
+  found, that flag is omitted — check the report and pass `--iar-path`.
+- The `--dlib_config` from the project's `GenRTConfigPath` is fed to the probe,
+  so `_DLIB_CONFIG_FILE_HEADER_NAME` matches the real build. `<toolkit>/lib` is
+  added to the include path because that config header lives there.
+
+## Known limitation: SFR names in vendor device headers
+
+IAR device headers declare special function registers with two vendor
+extensions at once:
+
+```c
+__saddr __no_init volatile union { unsigned char P0; __BITS8 P0_bit; } @ 0xFFF00;
+```
+
+clang cannot parse the `@ address` placement syntax, and even with it removed a
+**file-scope anonymous union does not export its members** in C (verified: also
+not under `-fms-extensions`). So SFR names do not resolve.
+
+Mitigation in place: `-ferror-limit=0` is always emitted. Without it the first
+19 parse errors abort the whole translation unit and *nothing* gets indexed;
+with it the damage stays inside the vendor header. clangd also collapses
+included-file errors, so the editor shows one squiggle at the `#include`, not
+hundreds.
+
+Measured on a 56-file RL78 project: 33 files (59%) clean apart from that single
+header squiggle, 23 files (41%) — the BSP/register layer — still report
+`use of undeclared identifier` for SFR names.
+
+Fixing it properly means generating named `extern` declarations plus member
+`#define`s from the device header and pre-defining its include guard so the
+original body is skipped. Not implemented.
+
+---
+
+# CMake
+
+CMake already emits a `compile_commands.json`; re-deriving one would only
+produce a worse copy. What CMake does *not* do is make it findable — see the
+placement section below, which is the entire reason this backend exists.
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Cmake2Clangd.py" -p <project_dir>
+```
+
+It runs `cmake -S <root> -B <build> -DCMAKE_EXPORT_COMPILE_COMMANDS=ON`,
+preferring `-G Ninja` (multi-config IDE generators — Visual Studio, Xcode — do
+not honour that switch and are refused up front), then locates the database,
+checks it covers real files, and drops a pointer `.clangd` where clangd will
+find it.
+
+- `--no-configure` consumes an existing database instead of running cmake.
+- `-b/--build-dir`, `-G/--generator`, `--cmake-args` pass through.
+- If the database's compiler is a cross driver (`arm-none-eabi-gcc`, …), the
+  script says so and prints the `CompileFlags.Compiler` + `--query-driver`
+  incantation. It does not add them itself.
+
+---
+
+# Config discovery placement — applies to ALL backends (CRITICAL)
 
 Validating content is not enough: clangd must be able to *find* the files.
 **clangd searches a source file's own directory and its ANCESTOR directories
-only — never sibling directories.** So both `.clangd` and `compile_commands.json`
-must sit on an ancestor path of the source files.
+only — never sibling directories.**
 
-The trap: `-o .` usually writes output into the `.uvprojx`/`Proj` folder, but
-sources often live in a *sibling* dir (e.g. entries read `../Code/main.c`, so
-sources are in `Proj/../Code` = `App/Code`, while output is in `App/Proj`).
-`Proj` is a sibling of `Code`, not an ancestor — so clangd never discovers the
-database. Symptom is deceptive: **same-file navigation still works, but
-cross-file jump-to-definition and find-references silently fail** (those need
-the background index, which needs the database).
+The trap: output lands in the `Proj`/`build` folder while sources live in a
+*sibling* dir (`Code`, `src`). The symptom is deceptive — **same-file navigation
+still works, but cross-file jump-to-definition and find-references silently
+fail**, because those need the background index, which needs the database.
 
-Check:
-1. Take the `directory` field + a `file` entry from `compile_commands.json`,
-   resolve to the source's real absolute dir (e.g. `App/Code`).
-2. Confirm the output dir (where you wrote the files) is that dir or an ancestor
-   of it. If the output dir is a *sibling* (or otherwise off the ancestor path),
-   clangd will not find it.
+All three backends now check this automatically and print
+`placement: OK` or `placement: PROBLEM`. On PROBLEM, `--fix-placement`
+(Keil/IAR) or the default behaviour (CMake) writes a pointer `.clangd` at the
+sources' deepest common ancestor:
 
-Fix (don't move the big generated file — drop a pointer): create a small
-`.clangd` on the sources' nearest ancestor dir containing:
 ```yaml
 CompileFlags:
-  CompilationDatabase: <relative-path-from-here-to-the-dir-with-compile_commands.json>
+  CompilationDatabase: <relative-path-to-the-dir-holding-compile_commands.json>
 ```
-e.g. a `.clangd` in `App/` with `CompilationDatabase: Proj`. Put it at the
-tightest ancestor that covers the sources but not unrelated sibling projects
-(e.g. `App/`, not the repo root, so a separate `Boot/` project is unaffected).
-Copy the `Diagnostics`/`ClangTidy` blocks from the generated `.clangd` into this
-pointer file too, since the generated one in the sibling dir won't be seen for
-those sources either.
 
-### 6. Fix issues found
+The pointer carries the `Diagnostics`/`ClangTidy` blocks too, since the real
+`.clangd` sits where clangd will never read it for those sources. Place it at
+the tightest ancestor that covers the sources but not unrelated sibling
+projects (e.g. `App/`, not the repo root, so a separate `Boot/` is unaffected).
 
-For any problems discovered in steps 3-5:
-- **Missing macros**: Add `-D` flags to `.clangd` CompileFlags.Add section using Edit
-- **Missing include paths**: Remove non-existent paths or fix to correct location
-- **Wrong Pack version**: Update version in path
-- **ARMCC-specific syntax errors**: Common Keil ARMCC extensions that clangd doesn't understand:
-  - `__packed` -> add `-D__packed=__attribute__((packed))`
-  - `__align(n)` -> add `-D__align(n)=__attribute__((aligned(n)))`
-  - `__weak` -> add `-D__weak=__attribute__((weak))`
-  - Add these to `.clangd` only if clangd reports errors on them
-- **Excessive clangd errors**: If too many errors from Keil headers, add specific diagnostics to Suppress
+---
 
-### 7. Report and restart
+# Fix issues found
 
-Tell the user:
-- Summary of what was generated
-- Any issues found and fixed
-- Any remaining warnings that need manual attention
-- Instruct to restart clangd: Ctrl+Shift+P -> "clangd: Restart language server"
+- **Missing macros**: add `-D` to `.clangd` `CompileFlags.Add`.
+- **Missing include paths**: remove or correct.
+- **Wrong Pack version**: update the version in the path.
+- **ARMCC syntax extensions** clangd rejects — add only if clangd complains:
+  - `__packed` → `-D__packed=__attribute__((packed))`
+  - `__align(n)` → `-D__align(n)=__attribute__((aligned(n)))`
+  - `__weak` → `-D__weak=__attribute__((weak))`
+- **Excessive errors from vendor headers**: add specific `Diagnostics.Suppress`
+  entries.
 
-## Project moved / new machine (re-anchor)
+Then tell the user what was generated, what was fixed, what still needs
+attention, and to restart clangd: Ctrl+Shift+P → "clangd: Restart language
+server".
 
-Generated files contain machine/location-bound paths. Measured behavior (clangd 22, Windows):
+---
+
+# Project moved / new machine (re-anchor)
+
+Generated files contain machine/location-bound paths. Measured behavior
+(clangd 22, Windows):
 
 1. `compile_commands.json`'s `directory` MUST be a correct absolute path on the
-   current machine — a relative value never works (clangd hard limit), and a stale
-   absolute value only works while clangd's CWD happens to be the project root.
+   current machine — a relative value never works (clangd hard limit), and a
+   stale absolute value only works while clangd's CWD happens to be the project
+   root.
 2. Relative `-I` in `.clangd` resolve against that `directory` anchor.
-3. Absolute toolchain `-I` (e.g. `C:/Keil_v5/...`) break across machines
-   (different drive/version) — only re-probing can fix them.
-
-Run the re-anchor tool after moving the project (same machine) or copying it to
-another machine:
+3. Absolute toolchain `-I` (e.g. `C:/Keil_v5/...`) break across machines — only
+   re-probing can fix them.
 
 ```powershell
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <project_root>
-# or double-click keil2clangd-reanchor.exe placed next to .clangd (build:
-# scripts/build_exe.bat; no Python/plugin needed on the target machine)
+# or double-click keil2clangd-reanchor.exe placed next to .clangd
+# (build: scripts/build_exe.bat; needs no Python or plugin on the target machine)
 ```
 
-**Ship the exe INSIDE the project (commit it).** The whole point of the exe is
-that it runs on machines with no Python and no plugin, so it must travel *with*
-the project. When you finish generating for a project, copy
-`scripts/dist/keil2clangd-reanchor.exe` next to the generated config (e.g. into
-the `Proj/` dir alongside `compile_commands.json`) and commit it, so whoever
-clones/copies the project to a new machine can just double-click it to re-anchor.
-It fixes machine-bound *paths* only — it does NOT fix the config-*discovery*
-placement issue in step 5b (that's a one-time fix, not per-machine).
+**Ship the exe INSIDE the project (commit it)** — the point of the exe is to run
+on machines with no Python and no plugin, so it must travel with the project.
 
 Behavior:
-- Same machine, moved folder: fully automatic — rewrites `directory`, leaves
-  everything else untouched.
-- New machine: probes Keil (`KEIL_PATH` -> `~/.keil2clangd.json` -> common
-  locations -> interactive prompt, answer saved) and rewrites dead toolchain
-  `-I`/`-imacros`. Pack-version mismatches are kept + warned — re-run this
-  skill to regenerate those entries.
-- Surgical by design: relative `-I`, `-D` macros, comments and AI-added lines
-  survive byte-for-byte. Originals backed up to `*.bak`. `--dry-run` previews.
-- Out of scope: files generated with `-a`/`--absolute` (absolute paths for
-  everything), and project-local preinclude headers resolved to absolute paths,
-  encode a machine-specific project location that isn't under `/ARM/` -- the
-  re-anchor tool cannot recognize or fix those; they are kept as dead + warned.
-  Regenerate the skill's output instead of re-anchoring in that case.
+- Same machine, moved folder: fully automatic — rewrites `directory` only.
+- New machine: probes Keil (`KEIL_PATH` → `~/.keil2clangd.json` → common
+  locations → prompt, saved) and rewrites dead toolchain `-I`/`-imacros`.
+  Pack-version mismatches are kept + warned — re-run this skill instead.
+- Surgical: relative `-I`, `-D` macros, comments and AI-added lines survive
+  byte-for-byte. Originals backed up to `*.bak`. `--dry-run` previews.
+- Out of scope: files generated with `-a`/`--absolute`, and project-local
+  preinclude headers resolved to absolute paths. Regenerate instead.
+- **IAR is not covered.** ReAnchor only knows Keil layouts; for a moved IAR
+  project just re-run `Iar2Clangd.py`, which re-probes everything anyway.
 
 Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 
-## Common issues the script can't handle
+---
+
+# Common issues the scripts can't handle
 
 | Issue | Symptom | Fix |
 |-------|---------|-----|
-| Keil Pack version mismatch | MISSING pack include path | Scan Pack dir for installed version, update path |
-| Macros defined in batch build | `#ifdef` on undefined macro | Ask user, add `-D` to .clangd |
-| ARMCC __packed/__align syntax | clangd syntax errors | Add `-D` compatibility macros |
-| Multiple targets, different configs | Wrong macros for user's build | Re-run with `--target-name` |
-| Keil headers clangd can't parse | `fatal_too_many_errors` | Switch to ARMCLANG headers or add Suppress rules |
-| Cross-drive paths (C: vs D:) | Relative path fails | Script handles this, but verify |
-| Keil not found on new machine | Prompted for path on first run | Enter path, auto-saved to `~/.keil2clangd.json` |
-| Wrong CMSIS version selected | Include path points to wrong version | Script reads .pdsc for version hint; verify in output |
-| Output dir is a sibling of the sources (not an ancestor) | Same-file jump works, but cross-file jump-to-def / find-references silently fail | clangd only searches ancestor dirs. Drop a pointer `.clangd` on the sources' ancestor with `CompileFlags.CompilationDatabase: <dir>` (see step 5b) |
+| Keil Pack version mismatch | MISSING pack include path | Scan Pack dir, update path |
+| Macros defined in a batch build | `#ifdef` on undefined macro | Ask user, add `-D` |
+| ARMCC `__packed`/`__align` | clangd syntax errors | Add `-D` compat macros |
+| Multiple targets/configurations | Wrong macros for the user's build | Re-run with `-t`/`-c` |
+| Vendor headers clangd can't parse | `fatal_too_many_errors` | `-ferror-limit=0` (IAR backend does this) |
+| IAR SFR `@ address` declarations | `use of undeclared identifier 'P0'` | Not solved — see the IAR limitation section |
+| Cross-drive paths (C: vs D:) | Relative path fails | Handled, but verify |
+| Toolchain not found on a new machine | Prompted on first run | Enter path, saved to `~/.keil2clangd.json` |
+| Output dir is a sibling of the sources | Same-file jump works, cross-file silently fails | `--fix-placement` |
+| CMake configured with a VS generator | No `compile_commands.json` at all | `-G Ninja` |
 
-## Script location
+# Script options
 
-Bundled with this plugin: `${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py`
-(IAR projects: `${CLAUDE_PLUGIN_ROOT}/scripts/Ewp2Json.py`)
-
-## Script options
-
+`Proj2Clangd.py`
 ```
--p, --path PATH         Search path for .uvprojx (default: current dir)
--a, --absolute          Use absolute paths
--t, --target-name NAME  Select specific Target in multi-target project
--k, --keil-path PATH    Keil installation path (overrides ~/.keil2clangd.json)
---no-clangd             Skip .clangd generation
---no-compile-commands   Skip compile_commands.json generation
---no-dep                Ignore Keil .dep; use .uvprojx (XML) only
---dep-path PATH         Explicit path to the target .dep file
---dry-run               Print info without writing files
--o, --output PATH       Output directory (default: current dir)
+-p, --path PATH       Directory to search (default: current dir)
+--kind {keil,iar,cmake}   Force a backend instead of detecting one
+--detect-only         Report what was found and exit
+<everything else>     Forwarded to the backend
 ```
 
-## Config file
+`Keil2Clangd.py`
+```
+-p PATH  -o PATH  -a/--absolute  -t/--target-name NAME  -k/--keil-path PATH
+--no-clangd  --no-compile-commands  --no-dep  --dep-path PATH
+--fix-placement  --dry-run
+```
 
-`~/.keil2clangd.json` — auto-created on first run, stores Keil path for all projects:
+`Iar2Clangd.py`
+```
+-p PATH  -o PATH  -a/--absolute  -c/--config NAME (alias -t/--target-name)
+--project PATH        Explicit .ewp, skipping the search
+--iar-path PATH       Workbench root, e.g. ".../Embedded Workbench 8.0"
+--iar-target TRIPLE   Override the clang --target ('' omits it)
+--no-probe            Do not run the compiler for predefined macros
+--probe-args "..."    Extra probe options, e.g. "--core s2 --data_model far"
+--no-core-probe       Skip device-header core negotiation
+--force-predef-header Write the preinclude header even with --no-probe
+--list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
+```
+
+`Cmake2Clangd.py`
+```
+-p PATH  -b/--build-dir PATH  -G/--generator NAME  --cmake PATH
+--cmake-args "..."  --no-configure  -o PATH (pointer .clangd location)
+--no-clangd  --dry-run
+```
+
+# Config file
+
+`~/.keil2clangd.json` — auto-created, shared by the backends:
 ```json
 {
-  "keil_path": "D:\\Keil_v5"
+  "keil_path": "D:\\Keil_v5",
+  "iar_path": "D:\\Software\\IAR Systems\\Embedded Workbench 8.0"
 }
 ```
+
+# Generated files
+
+| File | Backend | Note |
+|---|---|---|
+| `.clangd` | all | Flags + diagnostics, or a pointer when placement fails |
+| `compile_commands.json` | Keil, IAR | CMake writes its own into the build dir |
+| `k2c_iar_predef.h` | IAR | Probed macros + keyword shims, referenced via a **relative** `-imacros` so re-anchoring survives |

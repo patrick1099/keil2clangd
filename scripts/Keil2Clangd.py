@@ -8,12 +8,16 @@ for embedded C projects using ARMCC v5 or ARM Clang v6.
 
 import os
 import re
-import json
+import sys
 import argparse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import k2c_common as common
 
 
 # ---------------------------------------------------------------------------
@@ -41,7 +45,7 @@ CPU_ARCH_DEFINE_MAP = {
 }
 
 KEIL_FALLBACK_PATHS = ["D:/Keil_v5", "C:/Keil_v5", "C:/Keil"]
-CONFIG_FILE = Path.home() / '.keil2clangd.json'
+CONFIG_FILE = common.CONFIG_FILE
 
 
 # ---------------------------------------------------------------------------
@@ -336,31 +340,16 @@ class KeilPathResolver:
         # 5. Interactive prompt
         self._prompt_and_save()
 
-    @staticmethod
-    def _load_config():
-        if CONFIG_FILE.is_file():
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, OSError):
-                pass
-        return {}
-
-    @staticmethod
-    def _save_config(config):
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+    _load_config = staticmethod(common.load_config)
+    _save_config = staticmethod(common.save_config)
 
     @classmethod
     def _load_config_keil_path(cls):
-        return cls._load_config().get('keil_path')
+        return common.config_get('keil_path')
 
     @classmethod
     def _save_config_keil_path(cls, keil_path):
-        config = cls._load_config()
-        config['keil_path'] = keil_path
-        cls._save_config(config)
+        common.config_set('keil_path', keil_path)
 
     def _prompt_and_save(self):
         print("Keil installation not found automatically.")
@@ -491,17 +480,7 @@ class KeilPathResolver:
 # Path formatting helper
 # ---------------------------------------------------------------------------
 
-def _format_path(abs_path, base_dir, use_absolute):
-    """Format a path as relative or absolute, with forward slashes."""
-    abs_path = Path(abs_path).resolve()
-    if use_absolute:
-        return str(abs_path).replace('\\', '/')
-    try:
-        rel = os.path.relpath(str(abs_path), str(base_dir))
-        return rel.replace('\\', '/')
-    except ValueError:
-        # Cross-drive on Windows
-        return str(abs_path).replace('\\', '/')
+_format_path = common.format_path
 
 
 # ---------------------------------------------------------------------------
@@ -511,24 +490,9 @@ def _format_path(abs_path, base_dir, use_absolute):
 class ClangdGenerator:
     """Generate a .clangd YAML configuration file."""
 
-    CLANG_TIDY_ADD = [
-        "bugprone-*",
-        "readability-*",
-        "performance-*",
-    ]
-
-    CLANG_TIDY_REMOVE = [
-        "readability-magic-numbers",
-        "readability-identifier-length",
-        "bugprone-easily-swappable-parameters",
-        "performance-no-int-to-ptr",
-    ]
-
-    DIAGNOSTICS_SUPPRESS = [
-        "-Wunused-parameter",
-        "-Wmissing-prototypes",
-        "-Wstrict-prototypes",
-    ]
+    CLANG_TIDY_ADD = common.CLANG_TIDY_ADD
+    CLANG_TIDY_REMOVE = common.CLANG_TIDY_REMOVE
+    DIAGNOSTICS_SUPPRESS = common.DIAGNOSTICS_SUPPRESS
 
     def __init__(self, parser, keil_resolver, use_absolute=False, base_dir=None,
                  enrichment=None):
@@ -546,96 +510,54 @@ class ClangdGenerator:
         defines = self.parser.get_defines()
         include_paths = self.parser.get_include_paths()
 
-        lines = []
-        lines.append("CompileFlags:")
-        lines.append("  Add:")
+        doc = common.ClangdDoc()
 
-        # Target
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
-        lines.append(f"    # {cpu}")
-        lines.append(f"    - --target={target}")
+        doc.add_group(f"{cpu}", [f"--target={target}"])
 
-        # Compiler compatibility macros
-        lines.append("    # ARM C Compiler compatibility macros")
-        if compiler_info["is_ac6"]:
-            lines.append("    - -D__ARMCC_VERSION=6000000")
-        else:
-            lines.append("    - -D__CC_ARM")
-        lines.append("    - -D__arm__")
+        compat = ["-D__ARMCC_VERSION=6000000"] if compiler_info["is_ac6"] \
+            else ["-D__CC_ARM"]
+        compat.append("-D__arm__")
         arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
         if arch_define:
-            lines.append(f"    - -D{arch_define}")
+            compat.append(f"-D{arch_define}")
+        doc.add_group("ARM C Compiler compatibility macros", compat)
 
-        # Project macros
         if defines:
-            lines.append("    # Keil project macros")
-            for d in defines:
-                lines.append(f"    - -D{d}")
+            doc.add_group("Keil project macros", [f"-D{d}" for d in defines])
 
-        # Project include paths
-        lines.append("    # Include paths")
-        for p in include_paths:
-            formatted = _format_path(p, self.base_dir, self.use_absolute)
-            lines.append(f"    - -I{formatted}")
+        doc.add_group("Include paths",
+                      [f"-I{_format_path(p, self.base_dir, self.use_absolute)}"
+                       for p in include_paths])
 
-        # Keil compiler and pack includes
         if self.keil.found():
-            compiler_incs = self.keil.get_compiler_includes(
-                compiler_info["is_ac6"])
-            pack_incs = self.keil.get_pack_includes(pack_id)
+            keil_incs = (self.keil.get_compiler_includes(compiler_info["is_ac6"])
+                         + self.keil.get_pack_includes(pack_id))
+            doc.add_group(
+                "Keil/ARMCC standard library and CMSIS/device headers for clangd.",
+                [f"-I{_format_path(ki, self.base_dir, self.use_absolute)}"
+                 for ki in keil_incs])
 
-            keil_incs = compiler_incs + pack_incs
-            if keil_incs:
-                lines.append("    # Keil/ARMCC standard library and CMSIS/device headers for clangd.")
-                for ki in keil_incs:
-                    formatted = _format_path(ki, self.base_dir, self.use_absolute)
-                    lines.append(f"    - -I{formatted}")
-
-        # .dep enrichment: system includes + forced preinclude macros
         enr = self.enrichment
         if enr and enr.found and not enr.stale:
-            existing = {ln.strip() for ln in lines}
-            if enr.system_includes:
-                lines.append("    # Compiler system headers (from .dep)")
-                for inc in enr.system_includes:
-                    formatted = _format_path(inc, self.base_dir, self.use_absolute)
-                    flag = f"    - -I{formatted}"
-                    if flag.strip() not in existing:
-                        lines.append(flag)
-                        existing.add(flag.strip())
-            if enr.preinclude_files:
-                lines.append("    # Preinclude headers (from .dep)")
-                for pf in enr.preinclude_files:
-                    formatted = _format_path(pf, self.base_dir, self.use_absolute)
-                    lines.append("    - -imacros")
-                    lines.append(f"    - {formatted}")
+            doc.add_group(
+                "Compiler system headers (from .dep)",
+                [f"-I{_format_path(inc, self.base_dir, self.use_absolute)}"
+                 for inc in enr.system_includes])
+            preinclude_flags = []
+            for pf in enr.preinclude_files:
+                preinclude_flags += [
+                    "-imacros", _format_path(pf, self.base_dir, self.use_absolute)]
+            doc.add_group("Preinclude headers (from .dep)", preinclude_flags,
+                          allow_duplicates=True)
 
-        # Remove flags
-        lines.append("  Remove:")
-        lines.append("    # Drop warning flags that are noisy for embedded code")
-        lines.append("    - -W*")
-        lines.append("    - -pedantic")
-
-        # Diagnostics
-        lines.append("")
-        lines.append("Diagnostics:")
-        lines.append("  Suppress:")
-        for s in self.DIAGNOSTICS_SUPPRESS:
-            lines.append(f"    - {s}")
-        lines.append("  ClangTidy:")
-        lines.append("    Add:")
-        for a in self.CLANG_TIDY_ADD:
-            lines.append(f"      - {a}")
-        lines.append("    Remove:")
-        for r in self.CLANG_TIDY_REMOVE:
-            lines.append(f"      - {r}")
-
-        return '\n'.join(lines) + '\n'
+        doc.set_diagnostics(self.DIAGNOSTICS_SUPPRESS,
+                            self.CLANG_TIDY_ADD, self.CLANG_TIDY_REMOVE)
+        return doc.render()
 
     def write(self, output_path):
-        content = self.generate()
         out = Path(output_path) / '.clangd'
-        out.write_text(content, encoding='utf-8')
+        out.write_text(self.generate(), encoding='utf-8')
         print(f"Generated: {out}")
 
 
@@ -669,8 +591,6 @@ class CompileCommandsGenerator:
 
         target = CPU_TARGET_MAP.get(cpu, "armv6m-none-eabi")
         arch_define = CPU_ARCH_DEFINE_MAP.get(cpu)
-
-        dir_str = str(self.base_dir).replace('\\', '/')
 
         # Build common arguments
         base_args = [f"--target={target}"]
@@ -720,27 +640,12 @@ class CompileCommandsGenerator:
                 formatted = _format_path(pf, self.base_dir, self.use_absolute)
                 preinclude_args += ["-imacros", formatted]
 
-        entries = []
-        for sf in source_files:
-            file_str = _format_path(sf, self.base_dir, self.use_absolute)
-            file_args = base_args + preinclude_args
-            command = f"{compiler} -c {file_str} " + " ".join(file_args)
-            entry = {
-                "command": command,
-                "arguments": [compiler, "-c", file_str] + file_args,
-                "directory": dir_str,
-                "file": file_str,
-            }
-            entries.append(entry)
-
-        return entries
+        return common.make_compile_entries(
+            compiler, base_args + preinclude_args, source_files,
+            self.base_dir, self.use_absolute)
 
     def write(self, output_path):
-        entries = self.generate()
-        out = Path(output_path) / 'compile_commands.json'
-        with open(str(out), 'w', encoding='utf-8') as f:
-            json.dump(entries, f, indent=4, ensure_ascii=False)
-        print(f"Generated: {out}  ({len(entries)} entries)")
+        return common.write_compile_commands(self.generate(), output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -848,7 +753,7 @@ def check_macros(parser, keil_resolver):
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(
         description="Generate .clangd and compile_commands.json from Keil .uvprojx"
     )
@@ -872,8 +777,11 @@ def main():
                     help='Ignore Keil .dep build output; use .uvprojx only')
     ap.add_argument('--dep-path', default=None,
                     help='Explicit path to the target .dep file')
+    ap.add_argument('--fix-placement', action='store_true',
+                    help='Write a pointer .clangd when the output dir is not an '
+                         'ancestor of the sources')
 
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     # Find .uvprojx file
     search_path = Path(args.path).resolve()
@@ -907,12 +815,26 @@ def main():
                   f"+{len(enrichment.preinclude_files)} preinclude, "
                   f"{len(enrichment.source_files)} files)")
         elif enrichment.stale:
-            print(f".dep: STALE ({enrichment.dep_path} older than .uvprojx) — "
+            # Plain ASCII on purpose: this goes to Windows consoles running the
+            # GBK code page, where an em-dash cannot be encoded.
+            print(f".dep: STALE ({enrichment.dep_path} older than .uvprojx) -- "
                   f"ignored; rebuild the project to refresh system headers/preincludes.")
         else:
-            print(".dep: not found — using .uvprojx only (no build output).")
+            print(".dep: not found -- using .uvprojx only (no build output).")
     else:
         print(".dep: skipped (--no-dep).")
+
+    # Content is not enough: clangd must also be able to FIND the config, and it
+    # only ever searches a source file's own directory and its ancestors.
+    sources = (enrichment.source_files
+               if enrichment.found and not enrichment.stale and enrichment.source_files
+               else parser.get_source_files())
+    placement = common.check_placement(output_dir, sources)
+    print(placement.describe())
+    if not placement.ok and args.fix_placement and placement.anchor:
+        common.write_pointer_clangd(output_dir, placement.anchor)
+    elif not placement.ok:
+        print("  (re-run with --fix-placement to write that pointer automatically)")
 
     if args.dry_run:
         print("--dry-run: no files written.")
