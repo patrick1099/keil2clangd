@@ -34,6 +34,8 @@ py -3 scripts/Cmake2Clangd.py -p <工程目录>
 
 `-h` 查看全部选项。Keil / IAR 安装路径都会缓存到 `~/.keil2clangd.json`,后续工程复用。
 
+`--probe-args` 和 `--cmake-args` 的值以 `-` 开头,**必须用 `=` 连写**(`--cmake-args="-DFOO=BAR"`),否则 argparse 会把值当成另一个选项。
+
 ## IAR 后端为什么不猜宏
 
 `.ewp` 里存的是 IDE 下拉框的**索引**,含义随架构和 workbench 版本变,静态映射表必然出错。所以这个后端把编译器本身当作事实来源:

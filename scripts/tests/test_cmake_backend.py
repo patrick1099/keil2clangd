@@ -149,6 +149,24 @@ class TestGenerator(unittest.TestCase):
         self.assertIn("not found", result.reason)
 
 
+class TestCompilerCheckDetection(unittest.TestCase):
+    def test_link_failure_recognised(self):
+        output = ("The C compiler is not able to compile a simple test program\n"
+                  "lld-link: error: could not open 'advapi32.lib'\n"
+                  "clang: error: linker command failed with exit code 1\n")
+        self.assertTrue(cm._looks_like_compiler_check_failure(output))
+
+    def test_cross_toolchain_link_failure_recognised(self):
+        output = ("The C compiler is not able to compile a simple test program\n"
+                  "ld: cannot find -lc\n")
+        self.assertTrue(cm._looks_like_compiler_check_failure(output))
+
+    def test_ordinary_project_error_not_mistaken_for_it(self):
+        output = ("CMake Error at CMakeLists.txt:7 (add_executable):\n"
+                  "  Cannot find source file: src/missing.c\n")
+        self.assertFalse(cm._looks_like_compiler_check_failure(output))
+
+
 class TestCli(unittest.TestCase):
     def test_no_cmakelists_is_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
