@@ -188,7 +188,9 @@ def build_arg_parser():
                     help='CMake generator (default: Ninja when available)')
     ap.add_argument('--cmake', default=None, help='Path to the cmake executable')
     ap.add_argument('--cmake-args', default=None,
-                    help='Extra arguments forwarded to the configure step')
+                    help='Extra arguments forwarded to the configure step. The '
+                         'value starts with a dash, so it must be attached with '
+                         '"=": --cmake-args="-DFOO=BAR"')
     ap.add_argument('--no-configure', action='store_true',
                     help='Do not run cmake; use an existing compile database')
     ap.add_argument('-o', '--output', default=None,
@@ -199,6 +201,22 @@ def build_arg_parser():
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing or configuring')
     return ap
+
+
+_COMPILER_CHECK_MARKERS = (
+    'linker command failed',
+    'lld-link: error',
+    'ld: cannot find',
+    'could not open',
+    'The C compiler',
+    'The CXX compiler',
+    'is not able to compile a simple test program',
+)
+
+
+def _looks_like_compiler_check_failure(output):
+    """Did configure die in CMake's compiler check rather than on the project?"""
+    return sum(marker in output for marker in _COMPILER_CHECK_MARKERS) >= 2
 
 
 def _split(raw):
@@ -248,6 +266,14 @@ def main(argv=None):
                 print("ERROR: configure failed -- {0}".format(result.reason))
                 for line in result.output.splitlines()[-15:]:
                     print("  | {0}".format(line))
+                if _looks_like_compiler_check_failure(result.output):
+                    print()
+                    print("  This looks like CMake's compiler check failing at the")
+                    print("  LINK step, not a problem with the project. That is the")
+                    print("  normal case for a cross toolchain, or a host clang with")
+                    print("  no MSVC/SDK libraries installed. Make the check")
+                    print("  compile-only and try again:")
+                    print('    --cmake-args="-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY"')
                 return 1
             print("  cmake configure OK ({0})".format(generator or 'default generator'))
 

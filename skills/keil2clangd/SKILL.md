@@ -159,7 +159,7 @@ accepted. Candidates come from the probe's own `__<ARCH>_<n>__` macros.
 
 Getting this wrong is not subtle — device headers carry
 `#error "... for use with ICCRL78 option --core rl78_1 only"`. Disable with
-`--no-core-probe`, override with `--probe-args "--core s2"`.
+`--no-core-probe`, override with `--probe-args="--core s2"`.
 
 ## Extended keywords
 
@@ -247,6 +247,10 @@ find it.
 
 - `--no-configure` consumes an existing database instead of running cmake.
 - `-b/--build-dir`, `-G/--generator`, `--cmake-args` pass through.
+- If configure dies in CMake's **compiler check** — normal for a cross
+  toolchain, or a host clang with no MSVC/SDK libraries — the script says so and
+  suggests `--cmake-args="-DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY"`,
+  which makes that check compile-only.
 - If the database's compiler is a cross driver (`arm-none-eabi-gcc`, …), the
   script says so and prints the `CompileFlags.Compiler` + `--query-driver`
   incantation. It does not add them itself.
@@ -376,7 +380,7 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 --iar-path PATH       Workbench root, e.g. ".../Embedded Workbench 8.0"
 --iar-target TRIPLE   Override the clang --target ('' omits it)
 --no-probe            Do not run the compiler for predefined macros
---probe-args "..."    Extra probe options, e.g. "--core s2 --data_model far"
+--probe-args="..."    Extra probe options, e.g. --probe-args="--core s2"
 --no-core-probe       Skip device-header core negotiation
 --force-predef-header Write the preinclude header even with --no-probe
 --list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
@@ -385,9 +389,13 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 `Cmake2Clangd.py`
 ```
 -p PATH  -b/--build-dir PATH  -G/--generator NAME  --cmake PATH
---cmake-args "..."  --no-configure  -o PATH (pointer .clangd location)
+--cmake-args="..."  --no-configure  -o PATH (pointer .clangd location)
 --no-clangd  --dry-run
 ```
+
+**`--probe-args` and `--cmake-args` must use `=`.** Their values begin with a
+dash, so the space form (`--cmake-args "-DFOO=BAR"`) makes argparse read the
+value as another option and fail with "expected one argument".
 
 # Config file
 
