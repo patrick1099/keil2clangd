@@ -982,7 +982,9 @@ def build_arg_parser():
     ap.add_argument('--no-probe', action='store_true',
                     help='Do not run the IAR compiler to capture predefined macros')
     ap.add_argument('--probe-args', default=None,
-                    help='Extra options for the probe, e.g. "--core s2 --data_model far"')
+                    help='Extra options for the probe. The value starts with a '
+                         'dash, so it must be attached with "=": '
+                         '--probe-args="--core s2 --data_model far"')
     ap.add_argument('--no-core-probe', action='store_true',
                     help='Do not ask the compiler which --core the device header needs')
     ap.add_argument('--force-predef-header', action='store_true',
