@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "keil2clangd",
   "displayName": "Keil/IAR/CMake to clangd",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "从 Keil .uvprojx、IAR .ewp(任意架构:ICCARM/ICCRL78/ICCRX/ICC430)或 CMake 工程生成并校验 .clangd + compile_commands.json,让 clangd 对嵌入式 C 工程做跳转/补全/诊断。IAR 后端不猜内建宏,直接用 --predef_macros 探测真实编译器,并靠试编译谈判出正确的 --core;CMake 后端不重造数据库,只负责让 CMake 自己产的那份能被 clangd 找到。三个后端都会检查 clangd 的配置可发现性(输出目录必须是源码的祖先,不能是兄弟)。项目换目录或换电脑后,re-anchor 工具外科手术式修正失效路径,不动注释与手工增补。",
   "author": { "name": "xu" },
   "keywords": ["keil", "iar", "cmake", "clangd", "embedded", "compile-commands",
