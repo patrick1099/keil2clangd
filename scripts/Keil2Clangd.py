@@ -18,6 +18,7 @@ from typing import List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import k2c_common as common
+import k2c_macroscan as macroscan
 
 
 # ---------------------------------------------------------------------------
@@ -555,10 +556,14 @@ class ClangdGenerator:
                             self.CLANG_TIDY_ADD, self.CLANG_TIDY_REMOVE)
         return doc.render()
 
-    def write(self, output_path):
+    def write(self, output_path, dry_run=False):
         out = Path(output_path) / '.clangd'
+        if dry_run:
+            print(f"Would generate: {out}")
+            return out
         out.write_text(self.generate(), encoding='utf-8')
         print(f"Generated: {out}")
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -644,8 +649,9 @@ class CompileCommandsGenerator:
             compiler, base_args + preinclude_args, source_files,
             self.base_dir, self.use_absolute)
 
-    def write(self, output_path):
-        return common.write_compile_commands(self.generate(), output_path)
+    def write(self, output_path, dry_run=False):
+        return common.write_compile_commands(self.generate(), output_path,
+                                             dry_run=dry_run)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +659,12 @@ class CompileCommandsGenerator:
 # ---------------------------------------------------------------------------
 
 def check_macros(parser, keil_resolver):
-    """Print diagnostic info about the parsed project."""
+    """Print diagnostic info about the parsed project.
+
+    Returns the set of macro names known to be defined somewhere -- this
+    target, any other target, or the compiler -- which is what the hidden-macro
+    scan subtracts from the macros the sources actually test.
+    """
     cpu = parser.get_cpu_type()
     compiler_info = parser.get_compiler_info()
     pack_id = parser.get_pack_id()
@@ -717,6 +728,8 @@ def check_macros(parser, keil_resolver):
     else:
         print("\n[Keil installation] NOT FOUND")
 
+    known = macroscan.macro_names(defines) | macroscan.macro_names(auto_macros)
+
     # All targets with their macros
     targets = parser.list_targets()
     if len(targets) > 1:
@@ -727,6 +740,7 @@ def check_macros(parser, keil_resolver):
             t_parser = UvprojxParser(str(parser.file_path), target_name=t_name)
             t_defines = t_parser.get_defines()
             all_target_defines[t_name] = set(t_defines)
+            known |= macroscan.macro_names(t_defines)
             cur = " <-- selected" if t_name == selected_name else ""
             macros_str = ", ".join(t_defines) if t_defines else "(none)"
             print(f"  {t_name}{cur}")
@@ -747,6 +761,7 @@ def check_macros(parser, keil_resolver):
                 print(f"  -D{m}  (from: {', '.join(sources)})")
 
     print()
+    return known
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +795,13 @@ def main(argv=None):
     ap.add_argument('--fix-placement', action='store_true',
                     help='Write a pointer .clangd when the output dir is not an '
                          'ancestor of the sources')
+    ap.add_argument('--scan-hidden-macros', action='store_true',
+                    help='Report macros the sources test that no target defines')
+    ap.add_argument('--no-exe', action='store_true',
+                    help='Do not place keil2clangd-reanchor.exe in the project root')
+    ap.add_argument('--exe-dest', default=None,
+                    help='Directory for keil2clangd-reanchor.exe '
+                         '(default: the git repo root above the output dir)')
 
     args = ap.parse_args(argv)
 
@@ -803,7 +825,7 @@ def main(argv=None):
     output_dir = Path(args.output).resolve()
 
     # Always print macro / path check
-    check_macros(parser, keil)
+    known_macros = check_macros(parser, keil)
 
     # Build .dep enrichment (ground-truth supplement; XML stays authoritative)
     enrichment = DepEnrichment(found=False)
@@ -829,16 +851,17 @@ def main(argv=None):
     sources = (enrichment.source_files
                if enrichment.found and not enrichment.stale and enrichment.source_files
                else parser.get_source_files())
+    if args.scan_hidden_macros:
+        macroscan.report(sources, known_macros,
+                         base_dir=Path(uvprojx_path).parent)
+
     placement = common.check_placement(output_dir, sources)
     print(placement.describe())
     if not placement.ok and args.fix_placement and placement.anchor:
-        common.write_pointer_clangd(output_dir, placement.anchor)
+        common.write_pointer_clangd(output_dir, placement.anchor,
+                                    dry_run=args.dry_run)
     elif not placement.ok:
         print("  (re-run with --fix-placement to write that pointer automatically)")
-
-    if args.dry_run:
-        print("--dry-run: no files written.")
-        return 0
 
     # Generate
     if not args.no_clangd:
@@ -846,15 +869,22 @@ def main(argv=None):
                               use_absolute=args.absolute,
                               base_dir=output_dir,
                               enrichment=enrichment)
-        gen.write(output_dir)
+        gen.write(output_dir, dry_run=args.dry_run)
 
     if not args.no_compile_commands:
         gen = CompileCommandsGenerator(parser, keil,
                                        use_absolute=args.absolute,
                                        base_dir=output_dir,
                                        enrichment=enrichment)
-        gen.write(output_dir)
+        gen.write(output_dir, dry_run=args.dry_run)
 
+    if not args.no_exe:
+        root = (Path(args.exe_dest).resolve() if args.exe_dest
+                else common.find_project_root(output_dir, sources))
+        common.deploy_reanchor_exe(root, dry_run=args.dry_run)
+
+    if args.dry_run:
+        print("--dry-run: no files written.")
     return 0
 
 

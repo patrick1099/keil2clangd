@@ -1,12 +1,44 @@
 ---
 name: keil2clangd
-description: Generate and validate .clangd + compile_commands.json for embedded C projects from Keil .uvprojx, IAR .ewp (any architecture — ICCARM, ICCRL78, ICCRX, ICC430), or CMake. Use when setting up clangd-based jump/completion/diagnostics for a firmware project, when clangd reports missing macros / include paths / vendor-extension syntax errors, or when cross-file jump-to-definition silently fails while same-file navigation works.
+description: Generate and validate .clangd + compile_commands.json for embedded C projects from Keil .uvprojx, IAR .ewp (any architecture — ICCARM, ICCRL78, ICCRX, ICC430), or CMake. Use when setting up clangd-based jump/completion/diagnostics for a firmware project, when clangd reports missing macros / include paths / vendor-extension syntax errors, when cross-file jump-to-definition silently fails while same-file navigation works, or when an existing config must be carried somewhere else — the project moved, a new machine, another worktree/checkout, or "pull the config over from that other repo".
 ---
 
 # Project to clangd Configuration Generator
 
 Generate `.clangd` and `compile_commands.json` for an embedded C project, then
 validate the output and fix what the scripts cannot.
+
+## First: is there already a config to reuse? (CRITICAL)
+
+Whenever a working config exists **somewhere else** — the project moved, this is
+a new machine, a second worktree, or the user says "pull the config over from
+that other repo" — decide **reuse vs regenerate before touching a backend**.
+Skipping this decision is how the re-anchor tool gets forgotten.
+
+Three mechanical checks against the candidate config:
+
+| Check | Reuse | Regenerate |
+|---|---|---|
+| Project file name (`.uvprojx` / `.ewp`) | same | different |
+| Selected target / configuration | same | different |
+| Its `compile_commands.json` `file` list resolves under the new root | mostly yes | mostly no |
+
+```powershell
+# check 3, without changing anything
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <new_root> --dry-run
+```
+
+- **All three match** → copy the config over and re-anchor it. Keil only; see
+  the re-anchor section. This is the cheap path and it preserves hand edits.
+- **Any check fails** → regenerate from the project file, and **tell the user
+  why reuse was not possible** (different project, different target, file list
+  does not match). Silently regenerating looks like the tool was forgotten.
+
+ReAnchor rewrites *paths only* — never the file list, never `-D` macros. So a
+config from a **different project** cannot be fixed by re-anchoring, no matter
+how similar the directory layout looks. It now refuses such a database rather
+than "successfully" re-anchoring it, but do not rely on that as the decision;
+make it here.
 
 ## Pick a backend
 
@@ -43,34 +75,42 @@ picks the closest installed version ≥ that. Otherwise the latest installed.
 
 ## Steps
 
-### 1. Find the uvprojx and analyze ALL targets
+### 1. List the targets — with the script, not by hand
 
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> --dry-run
 ```
-Glob: **/*.uvprojx
-```
 
-If multiple are found, ask which one. Then read the XML and extract every
-target's configuration — for each `<Target>`: `<TargetName>`,
-`TargetArmAds/Cads/VariousControls/Define`, and `.../IncludePath`.
+This is the Keil counterpart of IAR's `--list-configs`: it prints every target
+with its macros, marks the selected one `<-- selected`, and warns about macros
+present in other targets but not this one. Do **not** hand-parse the XML — the
+script already does it, and a second parser only invites disagreement.
 
-**Present a comparison table:**
+If several `.uvprojx` are found (`Glob: **/*.uvprojx`), ask which one.
 
-| Target | Macros | Include path differences |
-|--------|--------|------------------------|
-| Iot-CSB-Debug_G048 | `__DEBUG, __G048` | `bsp/G048/...` |
-| Iot-CSB-Release_LG048 | `__CODE_IAP, __LG048` | `bsp/LG048/...` |
+Then ask which target to generate for.
 
 **Key point:** targets often differ in chip-variant macros (`__G048` vs
-`__LG048`), feature flags (`__CODE_IAP`, `USE_FULL_ASSERT`) and BSP paths. Ask
-which target to generate for. If the target name contains a variant (`LG048`)
-but its macros lack the matching define (`__LG048`), **check other targets and
-warn** — that is a common Keil misconfiguration.
+`__LG048`), feature flags (`__CODE_IAP`, `USE_FULL_ASSERT`) and BSP paths. If a
+target's name contains a variant (`LG048`) but its macros lack the matching
+define (`__LG048`), **say so** — that is a common Keil misconfiguration, and
+the user usually wants to know even when it is not the target being generated.
 
 ### 2. Run the script
 
 ```powershell
-py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> -o . -t <target_name>
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> -o . -t <target_name> --fix-placement --scan-hidden-macros
 ```
+
+`--fix-placement` belongs in the default command, not in a second run: Keil's
+standard layout puts the output in `Proj/` and the sources in a sibling
+`Code/`, so the placement problem is the norm, not the exception. When the
+placement is already fine the flag does nothing.
+
+`--scan-hidden-macros` performs step 3a/3d below.
+
+The exe for later re-anchoring is placed at the project root automatically;
+`--no-exe` skips it, `--exe-dest` picks a different directory.
 
 Flag any warnings: empty project macros, MISSING include paths, Keil not found.
 
@@ -89,10 +129,24 @@ Flag any warnings: empty project macros, MISSING include paths, Keil not found.
 
 ### 3. Validate macros (CRITICAL)
 
-**3a. Cross-target macro analysis** — collect macros from ALL targets, find any
-present in others but not the selected one, and check whether the codebase uses
-them via `#ifdef`/`#if defined`/`#ifndef`. Pay special attention to chip-variant
-macros.
+**3a / 3d. Cross-target and hidden macros — run `--scan-hidden-macros`.** Do not
+grep and tally by hand; this is a set difference over hundreds of files and two
+macro sets, and a manual pass is neither fast nor reproducible. The scan reads
+the generated `compile_commands.json` for its file list and splits every macro
+the code branches on into:
+
+- **defined by some target or the compiler** — resolved, silent;
+- **`#define`d by the sources themselves** (`FM33LG0XX`, `FL_*_DRIVER_ENABLED`,
+  project switches living in a header) — listed, no action;
+- **UNRESOLVED** — tested but defined nowhere. Those branches are inactive in
+  every build. Confirm with the user that this is intended.
+
+The middle bucket is the one hand-grepping gets wrong: a macro can be absent
+from every Keil target and still be **active**, because a header defines it.
+Never call a macro "dead in all builds" from an `#ifdef` grep alone.
+
+Include guards and language probes (`__cplusplus`, `__STDC__`, …) are filtered
+out; without that the report is mostly noise.
 
 **3b. Project macros** — every `Define` in the selected target's XML must appear
 as `-D` in `.clangd`.
@@ -101,9 +155,6 @@ as `-D` in `.clangd`.
 `__arm__`, arch define; ARM Clang v6 (uAC6=1) needs `__ARMCC_VERSION=6000000`,
 `__arm__`, arch define. Arch must match CPU: M0 → `__ARM_ARCH_6M__`,
 M3 → `__ARM_ARCH_7M__`, M4/M7 → `__ARM_ARCH_7EM__`.
-
-**3d. Hidden macros** — grep for `#ifdef`/`#if defined`/`#ifndef`, cross-check
-against all targets plus auto-macros, list unresolved ones and ask.
 
 ### 4. Validate include paths
 
@@ -183,8 +234,14 @@ not in the selected configuration.
 ### 2. Run
 
 ```powershell
-py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Iar2Clangd.py" -p <dir> -o <output_dir> -c <configuration>
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Iar2Clangd.py" -p <dir> -o <output_dir> -c <configuration> --fix-placement --scan-hidden-macros
 ```
+
+Same reasoning as Keil: `--fix-placement` is a no-op when the placement is
+already fine, so it belongs in the default command rather than a second run.
+No re-anchor exe is placed for IAR projects — ReAnchor does not understand IAR
+layouts, and `Iar2Clangd.py` re-probes everything anyway, so a moved IAR
+project is regenerated instead.
 
 Review the report: unresolved `$VAR$` in include paths, MISSING directories,
 whether the probe succeeded, which core was negotiated, which triple was picked.
@@ -318,12 +375,27 @@ Generated files contain machine/location-bound paths. Measured behavior
 
 ```powershell
 py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <project_root>
-# or double-click keil2clangd-reanchor.exe placed next to .clangd
+# or double-click keil2clangd-reanchor.exe at the project root
 # (build: scripts/build_exe.bat; needs no Python or plugin on the target machine)
 ```
 
-**Ship the exe INSIDE the project (commit it)** — the point of the exe is to run
-on machines with no Python and no plugin, so it must travel with the project.
+**The exe lives at the project root**, and the Keil backend puts it there
+automatically after a successful generation. It searches **downwards** from its
+own directory, so one exe at the top of the repo fixes every config below it —
+`Code/App/Proj/` and `Code/Boot/Proj/` in the same run, each anchored to its own
+directory. Pointer `.clangd` files are recognised and left alone.
+
+**Ship it INSIDE the project (commit it)** — the point of the exe is to run on
+machines with no Python and no plugin, so it must travel with the project. If
+the repo ignores `*.exe` the generator says so and offers the two ways out:
+
+```powershell
+git add -f keil2clangd-reanchor.exe     # track this one binary
+# or add  !keil2clangd-reanchor.exe  to .gitignore
+```
+
+Leaving it untracked is a legitimate third choice — a 9 MB binary in a firmware
+repo is a real cost. It is the user's call; do not edit `.gitignore` unasked.
 
 Behavior:
 - Same machine, moved folder: fully automatic — rewrites `directory` only.
@@ -332,12 +404,20 @@ Behavior:
   Pack-version mismatches are kept + warned — re-run this skill instead.
 - Surgical: relative `-I`, `-D` macros, comments and AI-added lines survive
   byte-for-byte. Originals backed up to `*.bak`. `--dry-run` previews.
+- **Ownership guard:** before writing anything it checks that the listed `file`
+  entries actually exist under the new root. A database belonging to a
+  *different* project is refused with a non-zero exit instead of being
+  "successfully" re-anchored into a silently useless index. ReAnchor only ever
+  rewrites paths — it cannot repair a wrong file list or wrong `-D` macros, so
+  regenerate instead. `--force` overrides; `--ownership-threshold` tunes how
+  many genuinely-deleted files are tolerated (default 10%).
 - Out of scope: files generated with `-a`/`--absolute`, and project-local
   preinclude headers resolved to absolute paths. Regenerate instead.
 - **IAR is not covered.** ReAnchor only knows Keil layouts; for a moved IAR
   project just re-run `Iar2Clangd.py`, which re-probes everything anyway.
 
-Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
+Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
+`--ownership-threshold F`, `--max-depth N`, `--no-pause`.
 
 ---
 
@@ -353,8 +433,10 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 | IAR SFR `@ address` declarations | `use of undeclared identifier 'P0'` | Not solved — see the IAR limitation section |
 | Cross-drive paths (C: vs D:) | Relative path fails | Handled, but verify |
 | Toolchain not found on a new machine | Prompted on first run | Enter path, saved to `~/.keil2clangd.json` |
-| Output dir is a sibling of the sources | Same-file jump works, cross-file silently fails | `--fix-placement` |
+| Output dir is a sibling of the sources | Same-file jump works, cross-file silently fails | `--fix-placement` (already in the default command) |
 | CMake configured with a VS generator | No `compile_commands.json` at all | `-G Ninja` |
+| Config copied in from another project | ReAnchor refuses: "does not belong to this project" | Regenerate; the file list and `-D` cannot be re-anchored |
+| Repo ignores `*.exe` | Re-anchor exe stays untracked | `git add -f`, negate in `.gitignore`, or accept local-only |
 
 # Script options
 
@@ -370,7 +452,12 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 ```
 -p PATH  -o PATH  -a/--absolute  -t/--target-name NAME  -k/--keil-path PATH
 --no-clangd  --no-compile-commands  --no-dep  --dep-path PATH
---fix-placement  --dry-run
+--fix-placement        Pointer .clangd when the output dir is not an ancestor
+--scan-hidden-macros   Report macros the code tests that nothing defines
+--no-exe               Do not place keil2clangd-reanchor.exe at the project root
+--exe-dest DIR         Put the exe somewhere other than the git repo root
+--dry-run              Report everything, write nothing (honoured by every
+                       writer, --fix-placement and the exe included)
 ```
 
 `Iar2Clangd.py`
@@ -383,7 +470,19 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--no-pause`.
 --probe-args="..."    Extra probe options, e.g. --probe-args="--core s2"
 --no-core-probe       Skip device-header core negotiation
 --force-predef-header Write the preinclude header even with --no-probe
+--scan-hidden-macros  Report macros the code tests that no configuration defines
 --list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
+```
+
+`ReAnchor.py`
+```
+--root PATH            Search here AND below (default: exe dir / cwd)
+-k/--keil-path PATH    Keil installation, skips the probe
+--dry-run              Report without writing
+--force                Re-anchor even when the file list does not match
+--ownership-threshold F  Fraction of listed files allowed missing (default 0.10)
+--max-depth N          How deep to search below the root (default 6)
+--no-pause             Do not wait for Enter (frozen exe)
 ```
 
 `Cmake2Clangd.py`
@@ -414,3 +513,4 @@ value as another option and fail with "expected one argument".
 | `.clangd` | all | Flags + diagnostics, or a pointer when placement fails |
 | `compile_commands.json` | Keil, IAR | CMake writes its own into the build dir |
 | `k2c_iar_predef.h` | IAR | Probed macros + keyword shims, referenced via a **relative** `-imacros` so re-anchoring survives |
+| `keil2clangd-reanchor.exe` | Keil | Placed at the git repo root; `--no-exe` skips it. Not written for IAR — ReAnchor cannot read IAR layouts |
