@@ -18,8 +18,10 @@ DEP_BODY = (
 
 
 def run(project_dir, *extra):
+    # --no-exe: these cases are about flag/dep handling, and copying the 9 MB
+    # re-anchor exe into every temp dir would dominate their runtime.
     cmd = [sys.executable, SCRIPT, "-p", str(project_dir), "-o", str(project_dir),
-           "-a", "-k", "/nonexistent"] + list(extra)
+           "-a", "-k", "/nonexistent", "--no-exe"] + list(extra)
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
