@@ -16,10 +16,14 @@ Nothing in here knows about a specific project file format.
 
 import json
 import os
+import shutil
+import subprocess
 from pathlib import Path
 
 
 CONFIG_FILE = Path.home() / '.keil2clangd.json'
+
+REANCHOR_EXE_NAME = 'keil2clangd-reanchor.exe'
 
 
 # ---------------------------------------------------------------------------
@@ -185,8 +189,11 @@ class ClangdDoc:
             lines += render_diagnostics(*self._diagnostics)
         return '\n'.join(lines) + '\n'
 
-    def write(self, output_dir):
+    def write(self, output_dir, dry_run=False):
         out = Path(output_dir) / '.clangd'
+        if dry_run:
+            print("Would generate: {0}".format(out))
+            return out
         out.write_text(self.render(), encoding='utf-8')
         print("Generated: {0}".format(out))
         return out
@@ -228,8 +235,11 @@ def make_compile_entries(compiler, base_args, source_files, base_dir,
     return entries
 
 
-def write_compile_commands(entries, output_dir):
+def write_compile_commands(entries, output_dir, dry_run=False):
     out = Path(output_dir) / 'compile_commands.json'
+    if dry_run:
+        print("Would generate: {0}  ({1} entries)".format(out, len(entries)))
+        return out
     with open(str(out), 'w', encoding='utf-8') as f:
         json.dump(entries, f, indent=4, ensure_ascii=False)
     print("Generated: {0}  ({1} entries)".format(out, len(entries)))
@@ -334,9 +344,102 @@ def render_pointer_clangd(database_dir, anchor_dir, suppress=None,
     return '\n'.join(lines) + '\n'
 
 
-def write_pointer_clangd(database_dir, anchor_dir, **kwargs):
+def write_pointer_clangd(database_dir, anchor_dir, dry_run=False, **kwargs):
+    """Write the pointer ``.clangd``; ``dry_run`` reports without touching disk.
+
+    The dry-run gate lives *inside* the write function on purpose: a preview
+    must travel the same code path as the real write, so the two can never
+    drift apart.
+    """
     out = Path(anchor_dir) / '.clangd'
+    if dry_run:
+        print("Would generate: {0}  (pointer to {1})".format(out, database_dir))
+        return out
     out.write_text(render_pointer_clangd(database_dir, anchor_dir, **kwargs),
                    encoding='utf-8')
     print("Generated: {0}  (pointer to {1})".format(out, database_dir))
     return out
+
+
+# ---------------------------------------------------------------------------
+# ReAnchor exe deployment
+# ---------------------------------------------------------------------------
+
+def reanchor_exe_source():
+    """Path to the prebuilt re-anchor exe shipped with the plugin, or None."""
+    cand = Path(__file__).resolve().parent / 'dist' / REANCHOR_EXE_NAME
+    return cand if cand.is_file() else None
+
+
+def find_project_root(start, sources=None):
+    """Best guess at the directory a human would call "the project root".
+
+    Walks up from ``start`` looking for a ``.git`` entry -- a file in a
+    worktree, a directory in a normal clone. Falls back to the common ancestor
+    of the output dir and the sources, which is the tightest directory that
+    still sits above everything the config describes.
+    """
+    start = Path(start).resolve()
+    for d in [start] + list(start.parents):
+        if (d / '.git').exists():
+            return d
+    if sources:
+        anchor = common_ancestor(list(sources) + [start])
+        if anchor:
+            return anchor
+    return start
+
+
+def _git_ignores(path):
+    """True when git would ignore ``path``. None when git cannot say."""
+    path = Path(path)
+    try:
+        proc = subprocess.run(
+            ['git', 'check-ignore', '-q', str(path)],
+            cwd=str(path.parent), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # 0 = ignored, 1 = not ignored, 128 = not a repo / git unusable
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    return None
+
+
+def deploy_reanchor_exe(project_root, dry_run=False):
+    """Copy the re-anchor exe to ``project_root`` so it is easy to find.
+
+    The exe re-anchors by scanning *downwards* from its own directory, so the
+    project root is the one place it works for every config in the tree -- and
+    the one place a human will actually spot it. Returns the destination path,
+    or None when nothing was deployed.
+    """
+    src = reanchor_exe_source()
+    if src is None:
+        print("re-anchor exe: not built -- skipped "
+              "(build it with scripts/build_exe.bat)")
+        return None
+
+    dest = Path(project_root).resolve() / REANCHOR_EXE_NAME
+    if dest.is_file() and dest.stat().st_size == src.stat().st_size:
+        print("re-anchor exe: already current at {0}".format(dest))
+        return dest
+
+    verb = "Would copy" if dry_run else "Copied"
+    if not dry_run:
+        try:
+            shutil.copy2(str(src), str(dest))
+        except OSError as e:
+            print("re-anchor exe: WARNING could not copy to {0} ({1})".format(dest, e))
+            return None
+    print("re-anchor exe: {0} -> {1}".format(verb, dest))
+
+    if _git_ignores(dest):
+        print("  NOTE: git ignores this file (a '*.exe' rule, most likely).")
+        print("  The exe is only useful to teammates if it travels with the repo:")
+        print("    git add -f {0}".format(REANCHOR_EXE_NAME))
+        print("    or add '!{0}' to .gitignore".format(REANCHOR_EXE_NAME))
+        print("  Leave it untracked if you would rather keep the binary local.")
+    return dest

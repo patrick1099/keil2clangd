@@ -35,6 +35,11 @@ class TestReanchorCli(unittest.TestCase):
         self.keil = base / "Keil_v5"
         (self.keil / "ARM" / "ARMCLANG" / "include").mkdir(parents=True)
         (self.proj / ".clangd").write_text(CLANGD, encoding="utf-8")
+        # The listed source must really exist: ReAnchor refuses a database whose
+        # file list does not match the tree it sits in.
+        (self.proj / "App").mkdir()
+        (self.proj / "App" / "main.c").write_text("int main(void){return 0;}\n",
+                                                  encoding="utf-8")
         args = ["arm-none-eabi-gcc", "-c", "App/main.c",
                 "-IApp/Code", "-ID:/OldKeil/ARM/ARMCLANG/include"]
         entries = [{"command": " ".join(args), "arguments": args,
@@ -137,6 +142,9 @@ class TestReanchorCliWriteFailure(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.proj = Path(self.tmp.name) / "proj"
         self.proj.mkdir()
+        (self.proj / "App").mkdir()
+        (self.proj / "App" / "main.c").write_text("int main(void){return 0;}\n",
+                                                  encoding="utf-8")
         # No absolute toolchain -I here: only the 'directory' mismatch triggers a
         # write, so no Keil auto-probe (and no stdin interaction) is involved.
         entries = [{"command": "arm-none-eabi-gcc -c App/main.c -IApp/Code",

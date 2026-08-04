@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import k2c_common as common
+import k2c_macroscan as macroscan
 
 
 # A --target is not optional. Without one clang defaults to the host triple,
@@ -870,6 +871,22 @@ def report(parser, resolver, probe, negotiator=None):
                 print("  -D{0}  (from: {1})".format(macro, ', '.join(sources_of)))
 
     print()
+    return known_macro_names(parser, probe)
+
+
+def known_macro_names(parser, probe):
+    """Every macro name defined by any configuration or by the compiler itself.
+
+    The probe contributes the 300+ predefined macros the real compiler reports,
+    so an architecture macro the code tests never shows up as "unresolved".
+    """
+    known = set()
+    for macros in parser.defines_by_config().values():
+        known |= macroscan.macro_names(macros)
+    known |= macroscan.macro_names(parser.get_defines())
+    if probe is not None and probe.ok:
+        known |= macroscan.names_from_define_lines(probe.macros)
+    return known
 
 
 # ---------------------------------------------------------------------------
@@ -878,7 +895,8 @@ def report(parser, resolver, probe, negotiator=None):
 
 def generate(parser, resolver, args):
     output_dir = Path(args.output).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
 
     probe = None
     negotiator = None
@@ -903,32 +921,38 @@ def generate(parser, resolver, args):
                 probe = PredefProbe(
                     compiler_exe, probe_args + ['--core', negotiator.chosen]).run()
 
-    report(parser, resolver, probe, negotiator)
+    known_macros = report(parser, resolver, probe, negotiator)
 
     sources = parser.get_source_files()
+
+    if args.scan_hidden_macros:
+        # Headers carry most of the interesting #ifdefs, so scan them too even
+        # though they are not compilation units.
+        macroscan.report(parser.get_source_files(include_headers=True),
+                         known_macros, base_dir=parser.project_root)
 
     placement = common.check_placement(output_dir, sources)
     print(placement.describe())
     if not placement.ok and args.fix_placement and placement.anchor:
-        common.write_pointer_clangd(output_dir, placement.anchor)
+        common.write_pointer_clangd(output_dir, placement.anchor,
+                                    dry_run=args.dry_run)
     elif not placement.ok:
         print("  (re-run with --fix-placement to write that pointer automatically)")
     print()
-
-    if args.dry_run:
-        print("--dry-run: no files written.")
-        return 0
 
     triple, undefs = choose_target(parser.get_toolchain(), probe, args.iar_target)
 
     predef_header = None
     if not args.no_probe or args.force_predef_header:
         predef_header = output_dir / PREDEF_HEADER_NAME
-        predef_header.write_text(
-            render_predef_header(probe, parser.get_toolchain(),
-                                 parser.get_compiler_id(), undefs),
-            encoding='utf-8')
-        print("Generated: {0}".format(predef_header))
+        if args.dry_run:
+            print("Would generate: {0}".format(predef_header))
+        else:
+            predef_header.write_text(
+                render_predef_header(probe, parser.get_toolchain(),
+                                     parser.get_compiler_id(), undefs),
+                encoding='utf-8')
+            print("Generated: {0}".format(predef_header))
 
     flags = IarFlags(parser, resolver, probe, predef_header, output_dir,
                      use_absolute=args.absolute, triple=triple)
@@ -937,14 +961,20 @@ def generate(parser, resolver, args):
         doc = common.ClangdDoc()
         for comment, group_flags in flags.groups():
             doc.add_group(comment, group_flags)
-        doc.write(output_dir)
+        doc.write(output_dir, dry_run=args.dry_run)
 
     if not args.no_compile_commands:
         entries = common.make_compile_entries(
             "arm-none-eabi-gcc" if (parser.get_toolchain() or '').upper() == 'ARM' else "clang",
             flags.flat_args(), sources, output_dir, use_absolute=args.absolute)
-        common.write_compile_commands(entries, output_dir)
+        common.write_compile_commands(entries, output_dir, dry_run=args.dry_run)
 
+    # No re-anchor exe here on purpose: ReAnchor only understands Keil layouts.
+    # A moved IAR project is re-generated instead -- Iar2Clangd re-probes the
+    # compiler anyway, so re-anchoring would buy nothing.
+
+    if args.dry_run:
+        print("--dry-run: no files written.")
     return 0
 
 
@@ -997,6 +1027,8 @@ def build_arg_parser():
                          'ancestor of the sources')
     ap.add_argument('--list-configs', action='store_true',
                     help='List the build configurations and exit')
+    ap.add_argument('--scan-hidden-macros', action='store_true',
+                    help='Report macros the sources test that no configuration defines')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing files')
     return ap
