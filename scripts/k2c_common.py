@@ -14,16 +14,24 @@ format but emits the same two artifacts, so the emission side lives here:
 Nothing in here knows about a specific project file format.
 """
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 
 CONFIG_FILE = Path.home() / '.keil2clangd.json'
 
 REANCHOR_EXE_NAME = 'keil2clangd-reanchor.exe'
+
+# Source files frozen into the re-anchor exe: ReAnchor imports Keil2Clangd,
+# which imports k2c_common and k2c_macroscan. Editing any of them leaves the
+# prebuilt exe behind.
+REANCHOR_EXE_SOURCES = ('ReAnchor.py', 'Keil2Clangd.py', 'k2c_common.py',
+                        'k2c_macroscan.py')
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +379,52 @@ def reanchor_exe_source():
     return cand if cand.is_file() else None
 
 
+def reanchor_exe_stale_sources(exe=None):
+    """Names of exe sources modified after the prebuilt exe was frozen.
+
+    The exe is a build artifact in a gitignored ``dist/``, so nothing forces it
+    to keep up with the scripts beside it. An exe built before a fix carries
+    that fix's *absence* into every project the generator touches, and reports
+    success while doing it -- the failure surfaces months later as a stale
+    error message no one can find in the source. Comparing mtimes is what turns
+    that silent drift into something the run says out loud.
+    """
+    exe = Path(exe) if exe is not None else reanchor_exe_source()
+    if exe is None or not exe.is_file():
+        return []
+    try:
+        built = exe.stat().st_mtime
+    except OSError:
+        return []
+    here = Path(__file__).resolve().parent
+    stale = []
+    for name in REANCHOR_EXE_SOURCES:
+        try:
+            if (here / name).stat().st_mtime > built:
+                stale.append(name)
+        except OSError:
+            continue
+    return stale
+
+
+def _same_bytes(a, b):
+    """Content equality by hash. Equal sizes are not equal builds."""
+    try:
+        if Path(a).stat().st_size != Path(b).stat().st_size:
+            return False
+        return _sha256(a) == _sha256(b)
+    except OSError:
+        return False
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(str(path), 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def find_project_root(start, sources=None):
     """Best guess at the directory a human would call "the project root".
 
@@ -422,8 +476,20 @@ def deploy_reanchor_exe(project_root, dry_run=False):
               "(build it with scripts/build_exe.bat)")
         return None
 
+    # Warn before the "already current" shortcut: a stale exe that is already
+    # in place is exactly the case that must not stay quiet.
+    stale = reanchor_exe_stale_sources(src)
+    if stale:
+        built = time.strftime('%Y-%m-%d', time.localtime(src.stat().st_mtime))
+        print("re-anchor exe: WARNING the prebuilt exe is OUT OF DATE "
+              "(built {0}).".format(built))
+        print("  Newer than it: {0}".format(', '.join(stale)))
+        print("  It will run with the old behaviour, including bugs already "
+              "fixed in the scripts.")
+        print("  Rebuild before relying on it: scripts/build_exe.bat")
+
     dest = Path(project_root).resolve() / REANCHOR_EXE_NAME
-    if dest.is_file() and dest.stat().st_size == src.stat().st_size:
+    if dest.is_file() and _same_bytes(src, dest):
         print("re-anchor exe: already current at {0}".format(dest))
         return dest
 
