@@ -397,6 +397,15 @@ git add -f keil2clangd-reanchor.exe     # track this one binary
 Leaving it untracked is a legitimate third choice — a 9 MB binary in a firmware
 repo is a real cost. It is the user's call; do not edit `.gitignore` unasked.
 
+**The exe is a build artifact and can lag the scripts.** `scripts/dist/` is
+gitignored, so editing `ReAnchor.py` / `Keil2Clangd.py` / `k2c_common.py` /
+`k2c_macroscan.py` does not rebuild anything — an old exe keeps shipping the old
+behaviour and reports success while doing it. Deployment now compares mtimes and
+says `WARNING the prebuilt exe is OUT OF DATE` when it drifts; when you see that,
+or after touching any of those four files, run `scripts/build_exe.bat` before
+trusting the exe. A copy already sitting in a project is *not* refreshed by
+size alone — the comparison is by content hash.
+
 Behavior:
 - Same machine, moved folder: fully automatic — rewrites `directory` only.
 - New machine: probes Keil (`KEIL_PATH` → `~/.keil2clangd.json` → common
@@ -437,6 +446,7 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 | CMake configured with a VS generator | No `compile_commands.json` at all | `-G Ninja` |
 | Config copied in from another project | ReAnchor refuses: "does not belong to this project" | Regenerate; the file list and `-D` cannot be re-anchored |
 | Repo ignores `*.exe` | Re-anchor exe stays untracked | `git add -f`, negate in `.gitignore`, or accept local-only |
+| Exe behaves like an older version | Its `--help`/errors don't match `ReAnchor.py` | It is a stale build — `scripts/build_exe.bat`, then redeploy |
 
 # Script options
 
