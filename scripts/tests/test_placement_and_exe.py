@@ -6,13 +6,17 @@ files written". The gate now lives inside the write functions themselves, so a
 preview and a real write travel the same code path.
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = HERE.parent
@@ -120,6 +124,85 @@ class TestReanchorExeDelivery(unittest.TestCase):
         r = run(self.proj, "--dry-run")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertFalse((self.root / common.REANCHOR_EXE_NAME).exists())
+
+
+class TestReanchorExeStaleness(unittest.TestCase):
+    """A prebuilt exe older than its sources must not ship in silence.
+
+    dist/ is gitignored, so the exe drifts behind the scripts with nothing to
+    say so: the 0.4.0 recursive-search fix sat in ReAnchor.py for weeks while
+    projects kept receiving a July build that still refused to look one
+    directory down.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.fake_exe = Path(self.tmp.name) / common.REANCHOR_EXE_NAME
+        self.fake_exe.write_bytes(b"MZ fake")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _set_mtime(self, path, when):
+        os.utime(str(path), (when, when))
+
+    def test_exe_older_than_sources_is_reported_stale(self):
+        self._set_mtime(self.fake_exe, 0)
+        stale = common.reanchor_exe_stale_sources(self.fake_exe)
+        self.assertEqual(sorted(stale), sorted(common.REANCHOR_EXE_SOURCES))
+
+    def test_exe_newer_than_sources_is_clean(self):
+        self._set_mtime(self.fake_exe, time.time() + 3600)
+        self.assertEqual(common.reanchor_exe_stale_sources(self.fake_exe), [])
+
+    def test_missing_exe_is_not_stale(self):
+        self.assertEqual(common.reanchor_exe_stale_sources(
+            Path(self.tmp.name) / "nope.exe"), [])
+
+    def test_deploy_warns_and_still_copies(self):
+        self._set_mtime(self.fake_exe, 0)
+        dest_root = Path(self.tmp.name) / "project"
+        dest_root.mkdir()
+        buf = io.StringIO()
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=self.fake_exe):
+            with redirect_stdout(buf):
+                dest = common.deploy_reanchor_exe(dest_root)
+        out = buf.getvalue()
+        self.assertIn("OUT OF DATE", out)
+        self.assertIn("ReAnchor.py", out)
+        self.assertIn("build_exe.bat", out)
+        self.assertTrue(dest.is_file())
+
+    def test_stale_warning_survives_the_already_current_shortcut(self):
+        """The exe already sitting in the project is the quietest stale case."""
+        self._set_mtime(self.fake_exe, 0)
+        dest_root = Path(self.tmp.name) / "project"
+        dest_root.mkdir()
+        (dest_root / common.REANCHOR_EXE_NAME).write_bytes(
+            self.fake_exe.read_bytes())
+        buf = io.StringIO()
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=self.fake_exe):
+            with redirect_stdout(buf):
+                common.deploy_reanchor_exe(dest_root)
+        out = buf.getvalue()
+        self.assertIn("OUT OF DATE", out)
+        self.assertIn("already current", out)
+
+    def test_same_size_different_build_is_replaced(self):
+        """Equal sizes were treated as 'already current' -- they are not."""
+        self._set_mtime(self.fake_exe, time.time() + 3600)
+        dest_root = Path(self.tmp.name) / "project"
+        dest_root.mkdir()
+        dest = dest_root / common.REANCHOR_EXE_NAME
+        dest.write_bytes(b"MZ OLD_")  # same length, different bytes
+        self.assertEqual(dest.stat().st_size, self.fake_exe.stat().st_size)
+        with mock.patch.object(common, "reanchor_exe_source",
+                               return_value=self.fake_exe):
+            with redirect_stdout(io.StringIO()):
+                common.deploy_reanchor_exe(dest_root)
+        self.assertEqual(dest.read_bytes(), b"MZ fake")
 
 
 class TestFindProjectRoot(unittest.TestCase):
