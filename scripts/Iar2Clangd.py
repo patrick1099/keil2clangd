@@ -391,6 +391,12 @@ class IarPathResolver:
         return best.resolve() if best else None
 
     def _prompt_and_save(self):
+        if not common.stdin_is_interactive():
+            print("IAR Embedded Workbench not found, and stdin is not a "
+                  "terminal -- not prompting.")
+            print("  Pass --iar-path, or set 'iar_path' in {0}."
+                  .format(common.CONFIG_FILE))
+            return
         print("IAR Embedded Workbench installation not found automatically.")
         print("Enter the workbench path "
               "(e.g. D:/Software/IAR Systems/Embedded Workbench 8.0):")
@@ -853,8 +859,14 @@ def report(parser, resolver, probe, negotiator=None):
         selected = parser.get_config_name()
         by_config = parser.defines_by_config()
         print("\n[All configurations] ({0})".format(len(configs)))
+        # Say what the marker actually means: without -c it is the first
+        # Configuration element in the .ewp, not the one selected in the IDE.
+        if parser.config_name is not None:
+            marker_text = " <-- chosen by -c"
+        else:
+            marker_text = " <-- default: FIRST IN XML (not the IDE's selection)"
         for name in configs:
-            marker = " <-- selected" if name == selected else ""
+            marker = marker_text if name == selected else ""
             macros = ", ".join(sorted(by_config[name])) or "(none)"
             print("  {0}{1}".format(name, marker))
             print("    Macros: {0}".format(macros))
@@ -869,6 +881,10 @@ def report(parser, resolver, probe, negotiator=None):
                 sources_of = [n for n, m in by_config.items()
                               if macro in m and n != selected]
                 print("  -D{0}  (from: {1})".format(macro, ', '.join(sources_of)))
+
+        if parser.config_name is None:
+            print("\n[ACTION REQUIRED] No -c was given. Ask which configuration "
+                  "the user actually builds, then re-run with -c <name>.")
 
     print()
     return known_macro_names(parser, probe)
@@ -975,7 +991,10 @@ def generate(parser, resolver, args):
 
     if args.dry_run:
         print("--dry-run: no files written.")
-    return 0
+        return 0
+
+    return common.run_verify(output_dir, no_verify=args.no_verify,
+                             strict=args.verify_strict)
 
 
 def _split_probe_args(raw):
@@ -1000,6 +1019,11 @@ def build_arg_parser():
                     default=None,
                     help='Build configuration to generate for (IAR calls these '
                          'configurations; -t is accepted for symmetry with Keil)')
+    ap.add_argument('--use-first-config', '--use-first-target',
+                    dest='use_first_config', action='store_true',
+                    help='Accept the first configuration in the XML instead of '
+                         'requiring -c. Only for unattended runs that truly do '
+                         'not care which build configuration is indexed')
     ap.add_argument('-a', '--absolute', action='store_true',
                     help='Use absolute paths in generated files')
     ap.add_argument('-o', '--output', default='.',
@@ -1029,6 +1053,11 @@ def build_arg_parser():
                     help='List the build configurations and exit')
     ap.add_argument('--scan-hidden-macros', action='store_true',
                     help='Report macros the sources test that no configuration defines')
+    ap.add_argument('--no-verify', action='store_true',
+                    help='Skip the post-generation self-check')
+    ap.add_argument('--verify-strict', action='store_true',
+                    help='Treat self-check warnings (missing include dirs, '
+                         'missing sources) as failures too')
     ap.add_argument('--dry-run', action='store_true',
                     help='Print the analysis without writing files')
     return ap
@@ -1047,11 +1076,37 @@ def locate_ewp(args):
         print("ERROR: No .ewp file found under {0}".format(search_path))
         return None
     if len(candidates) > 1:
-        print("Found {0} .ewp files; using the first. Use --project to choose:"
-              .format(len(candidates)))
+        # Printing a notice and carrying on with [0] is not a choice, it is a
+        # guess the caller never made. Refuse instead.
+        sys.stderr.write("ERROR: {0} .ewp files found under {1}; refusing to "
+                         "guess.\n".format(len(candidates), search_path))
         for c in candidates:
-            print("  {0}".format(c))
+            sys.stderr.write("  {0}\n".format(c))
+        sys.stderr.write("\nPick one and pass it explicitly:\n")
+        sys.stderr.write('  --project "{0}"\n'.format(candidates[0]))
+        return None
     return candidates[0]
+
+
+def refuse_ambiguous_config(ewp_path, parser):
+    """Refuse to guess between several build configurations. Returns exit code."""
+    configs = parser.list_configs()
+    by_config = parser.defines_by_config()
+    sys.stderr.write("ERROR: {0} has {1} build configurations and no -c was "
+                     "given; refusing to guess.\n"
+                     .format(ewp_path.name, len(configs)))
+    sys.stderr.write("Configurations differ in macros, so the wrong one "
+                     "indexes the wrong build.\n\n")
+    for name in configs:
+        macros = ", ".join(sorted(by_config.get(name, set()))) or "(none)"
+        sys.stderr.write("  {0}\n    Macros: {1}\n".format(name, macros))
+    sys.stderr.write("\nRe-run with the configuration the user actually "
+                     "builds:\n")
+    sys.stderr.write('  -c "{0}"\n'.format(configs[0]))
+    sys.stderr.write("\nUse --list-configs or --dry-run to inspect without "
+                     "writing, or --use-first-config only when the choice "
+                     "genuinely does not matter.\n")
+    return 2
 
 
 def main(argv=None):
@@ -1072,6 +1127,12 @@ def main(argv=None):
         for name in parser.list_configs():
             print(name)
         return 0
+
+    # An ambiguous configuration must be resolved by the caller, never by XML
+    # order. --dry-run and --list-configs stay open: they are how you look.
+    if (args.config is None and not args.use_first_config
+            and not args.dry_run and len(parser.list_configs()) > 1):
+        return refuse_ambiguous_config(ewp_path, parser)
 
     if parser.get_compiler_id() is None:
         print("ERROR: no ICC* compiler settings found in configuration '{0}'."
