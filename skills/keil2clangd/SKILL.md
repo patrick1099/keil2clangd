@@ -1,6 +1,6 @@
 ---
 name: keil2clangd
-description: Generate and validate .clangd + compile_commands.json for embedded C projects from Keil .uvprojx, IAR .ewp (any architecture — ICCARM, ICCRL78, ICCRX, ICC430), or CMake. Use when setting up clangd-based jump/completion/diagnostics for a firmware project, when clangd reports missing macros / include paths / vendor-extension syntax errors, when cross-file jump-to-definition silently fails while same-file navigation works, or when an existing config must be carried somewhere else — the project moved, a new machine, another worktree/checkout, or "pull the config over from that other repo".
+description: Generate and validate .clangd + compile_commands.json for embedded C projects from Keil .uvprojx, IAR .ewp (any architecture — ICCARM, ICCRL78, ICCRX, ICC430), or CMake. Use when setting up clangd-based jump/completion/diagnostics for a firmware project, when clangd reports missing macros / include paths / vendor-extension syntax errors, when cross-file jump-to-definition silently fails while same-file navigation works, when a generator refuses to pick between build targets or project files, or when an existing config must be carried somewhere else — the project moved, a new machine, another worktree/checkout, or "pull the config over from that other repo".
 ---
 
 # Project to clangd Configuration Generator
@@ -8,37 +8,11 @@ description: Generate and validate .clangd + compile_commands.json for embedded 
 Generate `.clangd` and `compile_commands.json` for an embedded C project, then
 validate the output and fix what the scripts cannot.
 
-## First: is there already a config to reuse? (CRITICAL)
-
-Whenever a working config exists **somewhere else** — the project moved, this is
-a new machine, a second worktree, or the user says "pull the config over from
-that other repo" — decide **reuse vs regenerate before touching a backend**.
-Skipping this decision is how the re-anchor tool gets forgotten.
-
-Three mechanical checks against the candidate config:
-
-| Check | Reuse | Regenerate |
-|---|---|---|
-| Project file name (`.uvprojx` / `.ewp`) | same | different |
-| Selected target / configuration | same | different |
-| Its `compile_commands.json` `file` list resolves under the new root | mostly yes | mostly no |
-
-```powershell
-# check 3, without changing anything
-py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <new_root> --dry-run
-```
-
-- **All three match** → copy the config over and re-anchor it. Keil only; see
-  the re-anchor section. This is the cheap path and it preserves hand edits.
-- **Any check fails** → regenerate from the project file, and **tell the user
-  why reuse was not possible** (different project, different target, file list
-  does not match). Silently regenerating looks like the tool was forgotten.
-
-ReAnchor rewrites *paths only* — never the file list, never `-D` macros. So a
-config from a **different project** cannot be fixed by re-anchoring, no matter
-how similar the directory layout looks. It now refuses such a database rather
-than "successfully" re-anchoring it, but do not rely on that as the decision;
-make it here.
+Generating is the default path. Do **not** go looking for an existing config to
+reuse first — searching for one costs more than regenerating. Reuse only comes
+up when the user brings it up ("the project moved", "pull the config over from
+that other repo", "new machine"), and it is handled under
+[Project moved / new machine](#project-moved--new-machine-re-anchor).
 
 ## Pick a backend
 
@@ -82,19 +56,33 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Keil2Clangd.py" -p <uvprojx_parent_dir> --d
 ```
 
 This is the Keil counterpart of IAR's `--list-configs`: it prints every target
-with its macros, marks the selected one `<-- selected`, and warns about macros
-present in other targets but not this one. Do **not** hand-parse the XML — the
-script already does it, and a second parser only invites disagreement.
+with its macros and warns about macros present in other targets but not the one
+that would be used. Do **not** hand-parse the XML — the script already does it,
+and a second parser only invites disagreement.
 
-If several `.uvprojx` are found (`Glob: **/*.uvprojx`), ask which one.
+The marker on that listing says exactly what it means. `<-- chosen by -t` is
+your choice; `<-- default: FIRST IN XML` is **not** the target selected in the
+Keil IDE — that lives in `.uvoptx` and nothing here reads it.
 
-Then ask which target to generate for.
+**You do not have to remember to ask.** Both ambiguous choices are refused by
+the script with a non-zero exit and a listing of the candidates:
+
+| Situation | Exit | Way out |
+|---|---|---|
+| Several `.uvprojx` under `-p` | 2 | `--project <path>` |
+| Several targets and no `-t` (when writing) | 2 | `-t <name>` |
+
+`--dry-run` is exempt — it is how you look before choosing, and it ends with an
+`[ACTION REQUIRED]` line naming what to pass next. `--use-first-target` exists
+for unattended runs that genuinely do not care which build gets indexed; it is
+not a shortcut around asking the user.
 
 **Key point:** targets often differ in chip-variant macros (`__G048` vs
 `__LG048`), feature flags (`__CODE_IAP`, `USE_FULL_ASSERT`) and BSP paths. If a
 target's name contains a variant (`LG048`) but its macros lack the matching
 define (`__LG048`), **say so** — that is a common Keil misconfiguration, and
 the user usually wants to know even when it is not the target being generated.
+No script checks this; it is a reminder to you, not a guarantee from the tool.
 
 ### 2. Run the script
 
@@ -148,23 +136,37 @@ Never call a macro "dead in all builds" from an `#ifdef` grep alone.
 Include guards and language probes (`__cplusplus`, `__STDC__`, …) are filtered
 out; without that the report is mostly noise.
 
-**3b. Project macros** — every `Define` in the selected target's XML must appear
-as `-D` in `.clangd`.
-
-**3c. Compiler macros (auto-added)** — ARMCC v5 (uAC6=0) needs `__CC_ARM`,
+**3b. Compiler macros (auto-added)** — ARMCC v5 (uAC6=0) needs `__CC_ARM`,
 `__arm__`, arch define; ARM Clang v6 (uAC6=1) needs `__ARMCC_VERSION=6000000`,
 `__arm__`, arch define. Arch must match CPU: M0 → `__ARM_ARCH_6M__`,
 M3 → `__ARM_ARCH_7M__`, M4/M7 → `__ARM_ARCH_7EM__`.
 
-### 4. Validate include paths
+### 4. Read the self-check — it already ran
 
-Check each `-I` exists. For Keil Pack paths, if the version mismatches, scan
-`{keil}/ARM/PACK/{vendor}/{pack}/` for installed versions.
+Checking each `-I`, each source file and each `-D` by hand used to be three
+sections of this document. It is now a check the script runs on its own output
+after every write, because a manual pass leaves no trace when it is skipped —
+and it was skipped. Both backends end with:
 
-### 5. Validate compile_commands.json
+```
+verify: OK -- 12 include path(s), 0 missing; 56 source file(s), 0 missing; 31 macro(s), consistent across both files
+```
 
-Check each source exists, `directory` is correct, and includes/defines agree
-with `.clangd`.
+or a list of what is wrong. What it reads back off disk:
+
+| Check | Severity | Why |
+|---|---|---|
+| every `-I` directory exists | warning | a toolchain missing on this machine is an honest cause |
+| every `file` entry exists | warning | a `.dep` can list a since-deleted source |
+| `directory` is an existing **absolute** path | **error** | clangd refuses a relative anchor outright |
+| `.clangd` and `compile_commands.json` agree on `-D` | **error** | the two files disagreeing can never be legitimate |
+
+Errors exit **3**. Warnings only print — pass `--verify-strict` to fail on them
+too, `--no-verify` to skip the check entirely.
+
+Your job is to **read the report and act on it**, not to redo it. Missing Keil
+Pack paths are the common warning: scan `{keil}/ARM/PACK/{vendor}/{pack}/` for
+the installed versions and correct the version in the path.
 
 ---
 
@@ -227,9 +229,19 @@ py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/Iar2Clangd.py" -p <dir> --list-configs
 ```
 
 Configurations usually differ in macros the same way Keil targets do (`Debug` =
-`_CODE_DEBUG_` vs `Releas_004` = `DEF_004`). Ask which one; the script also
-prints a cross-configuration table and warns about macros present elsewhere but
-not in the selected configuration.
+`_CODE_DEBUG_` vs `Releas_004` = `DEF_004`). The script prints a
+cross-configuration table and warns about macros present elsewhere but not in
+the one that would be used.
+
+The same refusals as Keil apply, for the same reason:
+
+| Situation | Exit | Way out |
+|---|---|---|
+| Several `.ewp` under `-p` | 1 | `--project <path>` |
+| Several configurations and no `-c` (when writing) | 2 | `-c <name>` |
+
+`--list-configs` and `--dry-run` are exempt; `--use-first-config` is the
+unattended escape hatch.
 
 ### 2. Run
 
@@ -248,7 +260,7 @@ whether the probe succeeded, which core was negotiated, which triple was picked.
 
 ### 3. Validate
 
-Same as the Keil steps 3–5, plus:
+The same self-check runs here (Keil step 4), plus these to read for yourself:
 
 - `-nostdinc` is emitted whenever IAR's own headers were found, so the standard
   library comes from the toolchain rather than the host. If IAR is **not**
@@ -344,7 +356,12 @@ projects (e.g. `App/`, not the repo root, so a separate `Boot/` is unaffected).
 
 # Fix issues found
 
-- **Missing macros**: add `-D` to `.clangd` `CompileFlags.Add`.
+Hand-editing `.clangd` alone will make the self-check report an ERROR next run,
+because `compile_commands.json` still carries the old `-D` set. Either edit both
+or regenerate.
+
+- **Missing macros**: add `-D` to `.clangd` `CompileFlags.Add` *and* to the
+  database's `arguments`.
 - **Missing include paths**: remove or correct.
 - **Wrong Pack version**: update the version in the path.
 - **ARMCC syntax extensions** clangd rejects — add only if clangd complains:
@@ -361,6 +378,37 @@ server".
 ---
 
 # Project moved / new machine (re-anchor)
+
+## Reuse or regenerate?
+
+Only reachable when the user brought up an existing config — the project moved,
+a new machine, a second worktree, "pull the config over from that other repo".
+Two questions, then run the third check:
+
+| Check | Reuse | Regenerate |
+|---|---|---|
+| Project file name (`.uvprojx`) | same | different |
+| Target being generated for | same | different |
+| `ReAnchor.py --dry-run` accepts the database | exit 0 | non-zero |
+
+```powershell
+py -3 "${CLAUDE_PLUGIN_ROOT}/scripts/ReAnchor.py" --root <new_root> --dry-run
+```
+
+That third check is not a judgement call: ReAnchor's ownership guard passes when
+**at least 90 % of the `file` entries exist under the new root**
+(`--ownership-threshold`, default 0.10 missing) and refuses otherwise.
+
+- **All three pass** → copy `.clangd` + `compile_commands.json` over by hand,
+  then re-anchor. Keil only. This preserves hand edits, which regenerating loses.
+- **Any fails** → regenerate, and say why reuse was not possible.
+
+ReAnchor rewrites *paths only* — never the file list, never `-D` macros. A
+config from a **different project** cannot be fixed by re-anchoring however
+similar the layout looks; the guard refuses it rather than producing a silently
+useless index.
+
+## Why paths break
 
 Generated files contain machine/location-bound paths. Measured behavior
 (clangd 22, Windows):
@@ -400,11 +448,19 @@ repo is a real cost. It is the user's call; do not edit `.gitignore` unasked.
 **The exe is a build artifact and can lag the scripts.** `scripts/dist/` is
 gitignored, so editing `ReAnchor.py` / `Keil2Clangd.py` / `k2c_common.py` /
 `k2c_macroscan.py` does not rebuild anything — an old exe keeps shipping the old
-behaviour and reports success while doing it. Deployment now compares mtimes and
-says `WARNING the prebuilt exe is OUT OF DATE` when it drifts; when you see that,
-or after touching any of those four files, run `scripts/build_exe.bat` before
-trusting the exe. A copy already sitting in a project is *not* refreshed by
-size alone — the comparison is by content hash.
+behaviour and reports success while doing it.
+
+Deployment answers two different questions with two different comparisons; they
+are easy to confuse:
+
+| Question | Compared by | Outcome |
+|---|---|---|
+| Is the built exe older than the scripts? | **mtime** | prints `WARNING the prebuilt exe is OUT OF DATE` |
+| Does the copy in the project differ from the built one? | **content hash** | re-copies, or reports "already current" |
+
+So a project copy is never judged by size or date — only by content. When you
+see that WARNING, or after touching any of those four files, run
+`scripts/build_exe.bat` before trusting the exe.
 
 Behavior:
 - Same machine, moved folder: fully automatic — rewrites `directory` only.
@@ -437,11 +493,14 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 | Keil Pack version mismatch | MISSING pack include path | Scan Pack dir, update path |
 | Macros defined in a batch build | `#ifdef` on undefined macro | Ask user, add `-D` |
 | ARMCC `__packed`/`__align` | clangd syntax errors | Add `-D` compat macros |
-| Multiple targets/configurations | Wrong macros for the user's build | Re-run with `-t`/`-c` |
+| Multiple targets/configurations | Refused, exit 2 | Ask the user, then `-t`/`-c` |
+| Multiple project files under `-p` | Refused, exit 2 (Keil) / 1 (IAR) | `--project <path>` |
+| `.clangd` and the database disagree on `-D` | `verify:` reports an ERROR, exit 3 | Regenerate; do not hand-patch one of the two |
 | Vendor headers clangd can't parse | `fatal_too_many_errors` | `-ferror-limit=0` (IAR backend does this) |
 | IAR SFR `@ address` declarations | `use of undeclared identifier 'P0'` | Not solved — see the IAR limitation section |
 | Cross-drive paths (C: vs D:) | Relative path fails | Handled, but verify |
-| Toolchain not found on a new machine | Prompted on first run | Enter path, saved to `~/.keil2clangd.json` |
+| Toolchain not found, run from a terminal | Prompted on first run | Enter path, saved to `~/.keil2clangd.json` |
+| Toolchain not found, run by an agent or CI | No prompt — stdin is not a tty, so it says so and carries on | Pass `-k`/`--iar-path`, or pre-fill `~/.keil2clangd.json` |
 | Output dir is a sibling of the sources | Same-file jump works, cross-file silently fails | `--fix-placement` (already in the default command) |
 | CMake configured with a VS generator | No `compile_commands.json` at all | `-G Ninja` |
 | Config copied in from another project | ReAnchor refuses: "does not belong to this project" | Regenerate; the file list and `-D` cannot be re-anchored |
@@ -462,8 +521,13 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 ```
 -p PATH  -o PATH  -a/--absolute  -t/--target-name NAME  -k/--keil-path PATH
 --no-clangd  --no-compile-commands  --no-dep  --dep-path PATH
+--project PATH         Explicit .uvprojx, skipping the search (required when
+                       -p finds more than one)
+--use-first-target     Take the first target in the XML instead of requiring -t
 --fix-placement        Pointer .clangd when the output dir is not an ancestor
 --scan-hidden-macros   Report macros the code tests that nothing defines
+--no-verify            Skip the post-generation self-check (it runs by default)
+--verify-strict        Fail on self-check warnings too, not just errors
 --no-exe               Do not place keil2clangd-reanchor.exe at the project root
 --exe-dest DIR         Put the exe somewhere other than the git repo root
 --dry-run              Report everything, write nothing (honoured by every
@@ -473,7 +537,10 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 `Iar2Clangd.py`
 ```
 -p PATH  -o PATH  -a/--absolute  -c/--config NAME (alias -t/--target-name)
---project PATH        Explicit .ewp, skipping the search
+--project PATH        Explicit .ewp, skipping the search (required when -p
+                      finds more than one)
+--use-first-config    Take the first configuration in the XML instead of
+                      requiring -c
 --iar-path PATH       Workbench root, e.g. ".../Embedded Workbench 8.0"
 --iar-target TRIPLE   Override the clang --target ('' omits it)
 --no-probe            Do not run the compiler for predefined macros
@@ -481,6 +548,8 @@ Flags: `--root PATH`, `-k/--keil-path PATH`, `--dry-run`, `--force`,
 --no-core-probe       Skip device-header core negotiation
 --force-predef-header Write the preinclude header even with --no-probe
 --scan-hidden-macros  Report macros the code tests that no configuration defines
+--no-verify           Skip the post-generation self-check (it runs by default)
+--verify-strict       Fail on self-check warnings too, not just errors
 --list-configs  --no-clangd  --no-compile-commands  --fix-placement  --dry-run
 ```
 
