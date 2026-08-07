@@ -353,6 +353,14 @@ class KeilPathResolver:
         common.config_set('keil_path', keil_path)
 
     def _prompt_and_save(self):
+        if not common.stdin_is_interactive():
+            # An agent or CI run inherits a pipe, not a console. EOFError below
+            # only saves us when that pipe is closed; one that stays open and
+            # silent would block forever, so do not reach the prompt at all.
+            print("Keil not found, and stdin is not a terminal -- not prompting.")
+            print(f"  Pass -k/--keil-path, set KEIL_PATH, or put 'keil_path' "
+                  f"in {CONFIG_FILE}.")
+            return
         print("Keil installation not found automatically.")
         print("Please enter the Keil installation path (e.g. D:/Keil_v5):")
         try:
@@ -735,13 +743,21 @@ def check_macros(parser, keil_resolver):
     if len(targets) > 1:
         print(f"\n[All targets and their macros] ({len(targets)})")
         selected_name = parser.get_target_name()
+        # The marker must not claim more than it knows: without -t this is
+        # merely the first Target element in the XML, which has nothing to do
+        # with whichever target is selected in the Keil IDE (that lives in
+        # .uvoptx and is not read here).
+        if parser.target_name is not None:
+            marker_text = " <-- chosen by -t"
+        else:
+            marker_text = " <-- default: FIRST IN XML (not Keil's IDE selection)"
         all_target_defines = {}
         for t_name in targets:
             t_parser = UvprojxParser(str(parser.file_path), target_name=t_name)
             t_defines = t_parser.get_defines()
             all_target_defines[t_name] = set(t_defines)
             known |= macroscan.macro_names(t_defines)
-            cur = " <-- selected" if t_name == selected_name else ""
+            cur = marker_text if t_name == selected_name else ""
             macros_str = ", ".join(t_defines) if t_defines else "(none)"
             print(f"  {t_name}{cur}")
             print(f"    Macros: {macros_str}")
@@ -760,8 +776,56 @@ def check_macros(parser, keil_resolver):
                            if m in d and t != selected_name]
                 print(f"  -D{m}  (from: {', '.join(sources)})")
 
+        if parser.target_name is None:
+            print("\n[ACTION REQUIRED] No -t was given. Ask which target the "
+                  "user actually builds, then re-run with -t <name>.")
+
     print()
     return known
+
+
+# ---------------------------------------------------------------------------
+# Ambiguity gates
+#
+# Both of these used to be a silent `[0]`. A caller that did not choose got a
+# config for whichever project/target happened to come first, with exit 0 and a
+# clean-looking report -- the failure surfaced days later as wrong macros. The
+# instruction "ask the user which one" only binds a caller that reads it, so the
+# refusal lives here instead of in the skill prose.
+# ---------------------------------------------------------------------------
+
+def _refuse_ambiguous_project(uvprojx_files, search_path):
+    """Refuse to guess between several .uvprojx. Returns the exit code."""
+    print(f"ERROR: {len(uvprojx_files)} .uvprojx files found under "
+          f"{search_path}; refusing to guess.", file=sys.stderr)
+    for p in uvprojx_files:
+        print(f"  {p}", file=sys.stderr)
+    print("\nPick one and pass it explicitly:", file=sys.stderr)
+    print(f'  --project "{uvprojx_files[0]}"', file=sys.stderr)
+    return 2
+
+
+def _refuse_ambiguous_target(uvprojx_path, target_names):
+    """Refuse to guess between several targets. Returns the exit code."""
+    print(f"ERROR: {uvprojx_path.name} has {len(target_names)} build targets "
+          f"and no -t was given; refusing to guess.", file=sys.stderr)
+    print("Targets differ in macros, so the wrong one indexes the wrong "
+          "build.\n", file=sys.stderr)
+    for name in target_names:
+        try:
+            defines = UvprojxParser(str(uvprojx_path),
+                                    target_name=name).get_defines()
+        except Exception:
+            defines = []
+        macros = ", ".join(defines) if defines else "(none)"
+        print(f"  {name}", file=sys.stderr)
+        print(f"    Macros: {macros}", file=sys.stderr)
+    print("\nRe-run with the target the user actually builds:", file=sys.stderr)
+    print(f'  -t "{target_names[0]}"', file=sys.stderr)
+    print("\nUse --dry-run to inspect targets without writing, or "
+          "--use-first-target only when the choice genuinely does not matter.",
+          file=sys.stderr)
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +842,12 @@ def main(argv=None):
                     help='Use absolute paths in generated files')
     ap.add_argument('-t', '--target-name', default=None,
                     help='Select a specific build target by name')
+    ap.add_argument('--project', default=None,
+                    help='Explicit .uvprojx path, skipping the search')
+    ap.add_argument('--use-first-target', action='store_true',
+                    help='Accept the first target in the XML instead of '
+                         'requiring -t. Only for unattended runs that truly '
+                         'do not care which build configuration is indexed')
     ap.add_argument('-k', '--keil-path', default=None,
                     help='Keil installation path (e.g. D:/Keil_v5)')
     ap.add_argument('--no-clangd', action='store_true',
@@ -797,6 +867,11 @@ def main(argv=None):
                          'ancestor of the sources')
     ap.add_argument('--scan-hidden-macros', action='store_true',
                     help='Report macros the sources test that no target defines')
+    ap.add_argument('--no-verify', action='store_true',
+                    help='Skip the post-generation self-check')
+    ap.add_argument('--verify-strict', action='store_true',
+                    help='Treat self-check warnings (missing include dirs, '
+                         'missing sources) as failures too')
     ap.add_argument('--no-exe', action='store_true',
                     help='Do not place keil2clangd-reanchor.exe in the project root')
     ap.add_argument('--exe-dest', default=None,
@@ -806,14 +881,30 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     # Find .uvprojx file
-    search_path = Path(args.path).resolve()
-    uvprojx_files = list(search_path.glob('**/*.uvprojx'))
-    if not uvprojx_files:
-        print(f"ERROR: No .uvprojx file found under {search_path}")
-        return 1
-
-    uvprojx_path = uvprojx_files[0]
+    if args.project:
+        uvprojx_path = Path(args.project).resolve()
+        if not uvprojx_path.is_file():
+            print(f"ERROR: --project does not exist: {uvprojx_path}",
+                  file=sys.stderr)
+            return 1
+    else:
+        search_path = Path(args.path).resolve()
+        uvprojx_files = sorted(search_path.glob('**/*.uvprojx'))
+        if not uvprojx_files:
+            print(f"ERROR: No .uvprojx file found under {search_path}",
+                  file=sys.stderr)
+            return 1
+        if len(uvprojx_files) > 1:
+            return _refuse_ambiguous_project(uvprojx_files, search_path)
+        uvprojx_path = uvprojx_files[0]
     print(f"Using: {uvprojx_path}")
+
+    # An ambiguous target must be resolved by the caller, never by XML order:
+    # picking silently produces a config for the wrong build with exit 0.
+    if args.target_name is None and not args.use_first_target:
+        all_targets = UvprojxParser(str(uvprojx_path)).list_targets()
+        if len(all_targets) > 1 and not args.dry_run:
+            return _refuse_ambiguous_target(uvprojx_path, all_targets)
 
     # Parse
     parser = UvprojxParser(str(uvprojx_path), target_name=args.target_name)
@@ -885,7 +976,10 @@ def main(argv=None):
 
     if args.dry_run:
         print("--dry-run: no files written.")
-    return 0
+        return 0
+
+    return common.run_verify(output_dir, no_verify=args.no_verify,
+                             strict=args.verify_strict)
 
 
 if __name__ == '__main__':

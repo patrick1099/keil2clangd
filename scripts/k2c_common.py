@@ -17,6 +17,8 @@ Nothing in here knows about a specific project file format.
 import hashlib
 import json
 import os
+import re
+import sys
 import shutil
 import subprocess
 import time
@@ -37,6 +39,19 @@ REANCHOR_EXE_SOURCES = ('ReAnchor.py', 'Keil2Clangd.py', 'k2c_common.py',
 # ---------------------------------------------------------------------------
 # ~/.keil2clangd.json
 # ---------------------------------------------------------------------------
+
+def stdin_is_interactive():
+    """True only when there is a real console to prompt on.
+
+    Agents and CI inherit a pipe. Prompting there either blocks until the run
+    is killed or silently consumes whatever the pipe holds; neither is a way to
+    ask a question.
+    """
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
 
 def load_config():
     """Return the user config dict, or {} if absent/unreadable."""
@@ -509,3 +524,187 @@ def deploy_reanchor_exe(project_root, dry_run=False):
         print("    or add '!{0}' to .gitignore".format(REANCHOR_EXE_NAME))
         print("  Leave it untracked if you would rather keep the binary local.")
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Post-generation self-check
+#
+# This used to be three sections of skill prose telling the caller to verify
+# the output by hand. Hand verification leaves no trace when it is skipped --
+# and it was skipped. Reading the files back off disk and saying what is wrong
+# costs a few milliseconds and cannot be forgotten.
+# ---------------------------------------------------------------------------
+
+_ADD_FLAG_RE = re.compile(r'^\s{4}-\s+(-\S.*?)\s*$')
+
+
+def parse_clangd_add_flags(clangd_path):
+    """Flags under ``CompileFlags.Add`` of a generated .clangd, in order.
+
+    Deliberately not a YAML parser: this only ever reads documents this package
+    rendered, and adding a dependency to re-read our own output would be a poor
+    trade. A pointer .clangd has no Add block and yields [].
+    """
+    flags = []
+    in_add = False
+    for line in Path(clangd_path).read_text(encoding='utf-8').splitlines():
+        stripped = line.strip()
+        if stripped.startswith('Add:'):
+            in_add = True
+            continue
+        if in_add:
+            if stripped.startswith(('Remove:', 'Diagnostics:', 'CompilationDatabase:')):
+                break
+            m = _ADD_FLAG_RE.match(line)
+            if m:
+                flags.append(m.group(1))
+    return flags
+
+
+def _defines(flags):
+    return {f[2:] for f in flags if f.startswith('-D')}
+
+
+def _includes(flags):
+    return [f[2:] for f in flags if f.startswith('-I')]
+
+
+class VerifyReport:
+    """What the generated config looks like when read back off disk.
+
+    ``errors`` are states that can never be legitimate -- the two generated
+    files disagreeing with each other, or an anchor clangd cannot use. They set
+    a non-zero exit. ``warnings`` are things that are usually wrong but have
+    honest causes (a toolchain not installed on this machine, a source listed
+    in a .dep that was since deleted), so they only print.
+    """
+
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+        self.notes = []
+
+    @property
+    def ok(self):
+        return not self.errors
+
+    def describe(self, strict=False):
+        lines = []
+        if self.ok and not self.warnings:
+            lines.append("verify: OK -- {0}".format(
+                '; '.join(self.notes) if self.notes else 'no problems found.'))
+            return '\n'.join(lines)
+
+        lines.append("verify: {0} error(s), {1} warning(s)"
+                     .format(len(self.errors), len(self.warnings)))
+        for note in self.notes:
+            lines.append("  {0}".format(note))
+        for msg in self.errors:
+            lines.append("  ERROR   {0}".format(msg))
+        for msg in self.warnings:
+            lines.append("  {0} {1}".format("ERROR  " if strict else "WARNING",
+                                            msg))
+        return '\n'.join(lines)
+
+
+def verify_output(output_dir):
+    """Read the generated .clangd + compile_commands.json back and check them.
+
+    Checks, in the order the skill used to ask a human for:
+      - every ``-I`` directory exists;
+      - every ``file`` entry exists;
+      - ``directory`` is an existing absolute path (clangd hard requirement);
+      - the ``-D`` set in .clangd equals the ``-D`` set in the database.
+    """
+    report = VerifyReport()
+    output_dir = Path(output_dir).resolve()
+    clangd_path = output_dir / '.clangd'
+    cc_path = output_dir / 'compile_commands.json'
+
+    if not clangd_path.is_file() and not cc_path.is_file():
+        report.errors.append(
+            "neither .clangd nor compile_commands.json exists in {0}"
+            .format(output_dir))
+        return report
+
+    clangd_flags = []
+    if clangd_path.is_file():
+        clangd_flags = parse_clangd_add_flags(clangd_path)
+        missing_inc = [i for i in _includes(clangd_flags)
+                       if not (output_dir / i).is_dir()]
+        report.notes.append("{0} include path(s), {1} missing".format(
+            len(_includes(clangd_flags)), len(missing_inc)))
+        for inc in missing_inc:
+            report.warnings.append("include path does not exist: {0}".format(inc))
+
+    if not cc_path.is_file():
+        return report
+
+    try:
+        entries = json.loads(cc_path.read_text(encoding='utf-8'))
+    except ValueError as exc:
+        report.errors.append("compile_commands.json is not valid JSON: {0}"
+                             .format(exc))
+        return report
+
+    missing_src = []
+    bad_dirs = set()
+    db_defines = set()
+    for entry in entries:
+        directory = entry.get('directory', '')
+        if not directory or not Path(directory).is_absolute():
+            # clangd resolves every relative -I against this anchor and refuses
+            # to work from a relative one, so this is fatal rather than untidy.
+            bad_dirs.add(directory or '(empty)')
+        elif not Path(directory).is_dir():
+            bad_dirs.add(directory)
+        src = Path(entry.get('file', ''))
+        if not src.is_absolute():
+            src = Path(directory or output_dir) / src
+        if not src.is_file():
+            missing_src.append(entry.get('file', ''))
+        db_defines |= _defines(entry.get('arguments', []))
+
+    report.notes.append("{0} source file(s), {1} missing"
+                        .format(len(entries), len(missing_src)))
+    for path in missing_src[:5]:
+        report.warnings.append("source file does not exist: {0}".format(path))
+    if len(missing_src) > 5:
+        report.warnings.append("... and {0} more missing source file(s)"
+                               .format(len(missing_src) - 5))
+    for directory in sorted(bad_dirs):
+        report.errors.append(
+            "compile_commands.json 'directory' must be an existing absolute "
+            "path, got: {0}".format(directory))
+
+    if clangd_flags:
+        clangd_defines = _defines(clangd_flags)
+        only_clangd = clangd_defines - db_defines
+        only_db = db_defines - clangd_defines
+        if only_clangd or only_db:
+            report.errors.append(
+                ".clangd and compile_commands.json disagree on -D macros "
+                "(clangd only: {0}; database only: {1})".format(
+                    ', '.join(sorted(only_clangd)) or 'none',
+                    ', '.join(sorted(only_db)) or 'none'))
+        else:
+            report.notes.append("{0} macro(s), consistent across both files"
+                                .format(len(clangd_defines)))
+    return report
+
+
+def run_verify(output_dir, no_verify=False, strict=False):
+    """Verify a freshly generated config and return the process exit code.
+
+    Runs by default. An opt-in check is one a hurried caller simply omits,
+    which is the failure this whole section exists to stop.
+    """
+    if no_verify:
+        return 0
+    report = verify_output(output_dir)
+    print(report.describe(strict=strict))
+    if report.errors:
+        return 3
+    if strict and report.warnings:
+        return 3
+    return 0
