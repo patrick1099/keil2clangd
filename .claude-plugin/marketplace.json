@@ -8,7 +8,7 @@
     {
       "name": "keil2clangd",
       "source": ".",
-      "description": "嵌入式仓库初始化两件套:① 从 Keil .uvprojx / IAR .ewp(任意架构)/ CMake 工程生成并校验 .clangd + compile_commands.json;② repo-hygiene 让 git status 只剩代码改动(.gitignore + skip-worktree 冻结 + 换行归一)"
+      "description": "嵌入式仓库初始化两件套:① 从 Keil .uvprojx / IAR .ewp(任意架构)/ CMake 工程生成并校验 .clangd + compile_commands.json;② repo-hygiene 让 git status 只剩代码改动(ignore 规则 + skip-worktree 冻结 + 换行归一),默认只写 .git/info/,共享文件零改动"
     }
   ]
 }

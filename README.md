@@ -63,22 +63,31 @@ Keil/IAR 仓库的待提交列表长期被编译残留、IDE 状态和索引配�
 
 | 噪音 | 例子 | 修法 | 用错会怎样 |
 |---|---|---|---|
-| 未跟踪的生成物 | `Objects/`、`*.map`、`.clangd`、`~$说明书.docx` | `.gitignore` | — |
-| **已跟踪**、只有本机在改 | `*.uvoptx`、`RTE_Components.h`、IAR `*.pbd` | `git update-index --skip-worktree` | `.gitignore` 对已跟踪文件**完全无效**;`git rm --cached` 会在同事下次 pull 时**删掉他们的文件** |
-| 内容没变却显示"已修改" | `*.uvprojx` | `git add --renormalize` + `.gitattributes -text` | 前两种都碰不到它 |
+| 未跟踪的生成物 | `Objects/`、`*.map`、`.clangd`、`~$说明书.docx` | ignore 规则 | — |
+| **已跟踪**、只有本机在改 | `*.uvoptx`、`RTE_Components.h`、IAR `*.pbd` | `git update-index --skip-worktree` | ignore 规则对已跟踪文件**完全无效**;`git rm --cached` 会在同事下次 pull 时**删掉他们的文件** |
+| 内容没变却显示"已修改" | `*.uvprojx` | `git add --renormalize` + `-text` 属性 | 前两种都碰不到它 |
 | 只有仓库主人能判断 | `Release/Useful/*.bin` | 报告,不动 | 猜错就是丢发布固件 |
+
+### 默认只写本机
+
+`.gitignore` 和 `.gitattributes` 是**从工作分支拉下来的共享文件**,改它们就把一个人的整理动作变成了所有同事都要 review 的提交。所以每种修法都有一个每份 clone 各自生效的形式,**默认走的就是它**:`.gitignore` → `.git/info/exclude`,`.gitattributes` → `.git/info/attributes`,skip-worktree 本来就在 `.git/index` 里。
+
+代价如实说:这三样都不会被 clone、不会被 push,重新检出要重跑;而且**仓库自己的 `.gitignore` 优先级高于 `.git/info/exclude`**(实测),被仓库规则挡住的文件本地放不出来,`!xxx` 在这里打不过——撞上就如实报告,不写静默失效的规则。真要动共享文件加 `--shared`。
 
 ```bash
 py -3 scripts/RepoHygiene.py -p <repo>                # 只扫描,默认什么都不写
 py -3 scripts/RepoHygiene.py -p <父目录> --each        # 扫描其下每个仓库
 py -3 scripts/RepoHygiene.py -p <repo> --apply --dry-run
-py -3 scripts/RepoHygiene.py -p <repo> --apply
+py -3 scripts/RepoHygiene.py -p <repo> --apply         # 全本地,仓库零改动
+py -3 scripts/RepoHygiene.py -p <repo> --apply --shared  # 改 .gitignore/.gitattributes
 py -3 scripts/RepoHygiene.py -p <repo> --unfreeze [<路径>...]
 ```
 
-生成的 `.gitignore` 分三段:生成块(每组规则带一句为什么)、手工增补区(旧文件里无规则覆盖的行原样搬进来,重跑不动它)、例外区(`!keil2clangd-reanchor.exe`,**必须在最后**,因为 git 按最后一条匹配的规则决定)。旧文件存 `.gitignore.bak`。
+写出来的规则块分三段:生成块(每组规则上方一行注释说明为什么)、手工增补区(旧文件里无规则覆盖的行原样搬进来,重跑不动它)、例外区(`!keil2clangd-reanchor.exe`,**必须在最后**,因为 git 按最后一条匹配的规则决定)。`--shared` 时旧 `.gitignore` 存 `.gitignore.bak`。
 
-**写完用真 git 自检。** `.gitignore` 和 `.gitattributes` 都**不支持行尾注释**——`Objects/  # 输出目录` 会被 git 当成一个含空格和 `#` 的模式,匹配不到任何东西,而 git 从不报告"这条规则没匹配上任何文件"。所以自检问的不是"文件写出去了吗",是"git 现在真的忽略这些文件了吗"(`git check-ignore -z --stdin` / `git check-attr`)。
+**写完用真 git 自检。** `.gitignore` 和 `.gitattributes` 都**不支持行尾注释**——`Objects/  # 输出目录` 会被 git 当成一个含空格和 `#` 的模式,匹配不到任何东西,而 git 从不报告"这条规则没匹配上任何文件"。所以自检问的不是"文件写出去了吗",是"git 现在真的忽略这些文件了吗"(`git check-ignore -z --stdin` / `git check-attr`)。`-z` 不能省:非 ASCII 路径会被 C-quoting,对不上就把好规则误报成失效。
+
+幻影修改那一类有两道闸:**只对"裸字节 == index blob"的文件加 `-text`**(判定必须用 `git hash-object --no-filters`——不加会套 filter,CRLF 工作区 + LF blob 算出相同 hash),否则加 `-text` 不是暴露幻影而是凭空造出真实差异,`--renormalize` 会把 CRLF 提交进去;以及 **`--renormalize` 若真 stage 了内容就立刻 `git reset` 撤回**。顺序上先写属性再 renormalize,并重新探测幻影列表。
 
 `*.uvprojx` **永不冻结**——它是真正的工程定义(源文件清单、编译宏、优化等级),改了必须提交。
 
@@ -89,7 +98,7 @@ py -3 scripts/RepoHygiene.py -p <repo> --unfreeze [<路径>...]
 .claude-plugin/marketplace.json  可直接作为 marketplace 安装
 skills/keil2clangd/SKILL.md      skill(clangd 配置流程 + 校验)
 skills/repo-hygiene/SKILL.md     skill(git 噪音治理)
-scripts/RepoHygiene.py           .gitignore / skip-worktree 冻结 / 换行归一
+scripts/RepoHygiene.py           ignore 规则 / skip-worktree 冻结 / 换行归一(默认只写 .git/info/)
 scripts/Proj2Clangd.py           统一入口:识别工程类型并分发
 scripts/k2c_common.py            共用:路径格式化 / .clangd 渲染 / 数据库写出 / 位置校验
 scripts/Keil2Clangd.py           Keil 后端

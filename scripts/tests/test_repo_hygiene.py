@@ -23,9 +23,12 @@ def make_repo(tmp, files, gitignore=None, commit=True):
     for rel, text in files.items():
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text, encoding='utf-8')
+        # write_bytes, not write_text: on Windows the text path turns '\n' into
+        # '\r\n', which makes every fixture file a CRLF-worktree/LF-index case
+        # and quietly changes what these tests are testing.
+        p.write_bytes(text.encode('utf-8'))
     if gitignore is not None:
-        (root / '.gitignore').write_text(gitignore, encoding='utf-8')
+        (root / '.gitignore').write_bytes(gitignore.encode('utf-8'))
     if commit:
         _git(['add', '-A'], root)
         _git(['commit', '-qm', 'init'], root)
@@ -106,7 +109,7 @@ class TestPlanClassification(unittest.TestCase):
                 'Proj/B.uvoptx': '<x/>\n',
                 'Proj/RTE/_T/RTE_Components.h': '#define X\n',
             })
-            (root / 'Proj' / 'A.uvoptx').write_text('<y/>\n', encoding='utf-8')
+            (root / 'Proj' / 'A.uvoptx').write_bytes(b'<y/>\n')
             plan = rh.build_plan(rh.RepoState(root))
             frozen = [p for p, _ in plan.freeze]
             self.assertEqual(sorted(frozen), ['Proj/A.uvoptx', 'Proj/B.uvoptx',
@@ -240,7 +243,7 @@ class TestRender(unittest.TestCase):
         (root / 'real_source.c').write_text('x', encoding='utf-8')
 
         plan = rh.build_plan(rh.RepoState(root))
-        rh.write_gitignore(plan)
+        rh.write_ignore(plan, shared=True)
         self.assertEqual(rh.verify_with_git(plan), [])
 
         # Only the real source is left -- plus the freshly written .gitignore,
@@ -269,7 +272,7 @@ class TestRender(unittest.TestCase):
         root = make_repo(tmp, {'main.c': 'x\n'}, gitignore="*.exe\n")
         (root / 'keil2clangd-reanchor.exe').write_bytes(b'MZ')
         (root / 'setup.exe').write_bytes(b'MZ')
-        rh.write_gitignore(rh.build_plan(rh.RepoState(root)))
+        rh.write_ignore(rh.build_plan(rh.RepoState(root)), shared=True)
 
         untracked = rh.RepoState(root).untracked
         self.assertIn('keil2clangd-reanchor.exe', untracked)
@@ -279,7 +282,7 @@ class TestRender(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         root = make_repo(tmp, {'main.c': 'x\n'}, gitignore="Doc/私有/\n")
         plan = rh.build_plan(rh.RepoState(root))
-        rh.write_gitignore(plan)
+        rh.write_ignore(plan, shared=True)
         first = (root / '.gitignore').read_text(encoding='utf-8')
         self.assertIn('Doc/私有/', first)
 
@@ -301,7 +304,7 @@ class TestRender(unittest.TestCase):
         # below the negation block. Dropping it would be silent data loss.
         tmp = tempfile.mkdtemp()
         root = make_repo(tmp, {'main.c': 'x\n'}, gitignore='')
-        rh.write_gitignore(rh.build_plan(rh.RepoState(root)))
+        rh.write_ignore(rh.build_plan(rh.RepoState(root)), shared=True)
         path = root / '.gitignore'
         path.write_text(path.read_text(encoding='utf-8') + '追加在最后/\n',
                         encoding='utf-8')
@@ -311,6 +314,135 @@ class TestRender(unittest.TestCase):
         self.assertLess(text.index('追加在最后/'), text.index(rh.NEGATION_MARKER))
 
 
+class TestLocalMode(unittest.TestCase):
+    """The default: fix everything without touching a tracked file."""
+
+    def test_local_writes_info_exclude_and_leaves_gitignore_alone(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'}, gitignore="*.o\n")
+        (root / 'Code').mkdir()
+        (root / 'Code' / '.clangd').write_text('x', encoding='utf-8')
+
+        plan = rh.build_plan(rh.RepoState(root))
+        rh.write_ignore(plan)                       # local is the default
+
+        self.assertEqual((root / '.gitignore').read_text(encoding='utf-8'),
+                         "*.o\n")
+        self.assertFalse((root / '.gitignore.bak').exists())
+        exclude = (root / '.git' / 'info' / 'exclude').read_text(encoding='utf-8')
+        self.assertIn('.clangd', exclude)
+        # and the repo has no pending change at all
+        self.assertEqual(rh.RepoState(root).modified, set())
+        self.assertEqual(rh.RepoState(root).untracked, [])
+
+    def test_local_run_keeps_whatever_was_in_info_exclude(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'})
+        excl = root / '.git' / 'info' / 'exclude'
+        excl.write_text("# git 自带的注释\n我自己加的/\n", encoding='utf-8')
+
+        rh.write_ignore(rh.build_plan(rh.RepoState(root)))
+        text = excl.read_text(encoding='utf-8')
+        self.assertIn('我自己加的/', text)
+        self.assertIn('# git 自带的注释', text)
+
+        # re-running does not stack the generated block
+        rh.write_ignore(rh.build_plan(rh.RepoState(root)))
+        text2 = excl.read_text(encoding='utf-8')
+        self.assertEqual(text2.count(rh.GENERATED_BANNER), 1)
+        self.assertEqual(text2.count('我自己加的/'), 1)
+
+    def test_local_emits_no_negation_because_it_would_lose(self):
+        # A repo .gitignore outranks .git/info/exclude, so `!x` here is a lie.
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n'}, gitignore="*.exe\n")
+        plan = rh.build_plan(rh.RepoState(root))
+        text = rh.render_rule_block(plan, shared=False)
+        self.assertNotIn('!keil2clangd-reanchor.exe', text)
+        self.assertIn('!keil2clangd-reanchor.exe',
+                      rh.render_rule_block(plan, shared=True))
+
+    def test_local_attributes_append_never_clobber(self):
+        # This file is where clean/smudge filters live; overwriting one breaks
+        # it with no visible symptom until wrong bytes are committed.
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'Proj/P.uvprojx': '<x/>\n'})
+        attrs = root / '.git' / 'info' / 'attributes'
+        attrs.write_text("*.c filter=my-private-filter\n", encoding='utf-8')
+
+        rh.write_gitattributes(rh.build_plan(rh.RepoState(root)))
+        text = attrs.read_text(encoding='utf-8')
+        self.assertIn('*.c filter=my-private-filter', text)
+        self.assertIn('*.uvprojx -text', text)
+        self.assertFalse((root / '.gitattributes').exists())
+
+    def test_text_attribute_is_skipped_when_it_would_invent_a_diff(self):
+        # A file committed under core.autocrlf keeps CRLF on disk and LF in the
+        # index. Turning normalisation off there does not reveal a phantom --
+        # it manufactures a real diff, and renormalize would commit the CRLF.
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp)
+        _git(['init', '-q'], root)
+        _git(['config', 'user.email', 't@t'], root)
+        _git(['config', 'user.name', 't'], root)
+        _git(['config', 'core.autocrlf', 'true'], root)
+        (root / 'Proj').mkdir()
+        (root / 'Proj' / 'P.uvprojx').write_bytes(b'<x/>\r\n')
+        _git(['add', '-A'], root)
+        _git(['commit', '-qm', 'init'], root)
+        (root / 'Proj' / 'P.uvprojx').write_bytes(b'<x/>\r\n')  # still CRLF
+
+        plan = rh.build_plan(rh.RepoState(root))
+        self.assertFalse(rh.write_gitattributes(plan))
+        self.assertFalse((root / '.git' / 'info' / 'attributes').exists())
+        self.assertEqual(rh.RepoState(root).modified, set())
+
+    def test_renormalize_undoes_anything_it_accidentally_stages(self):
+        tmp = tempfile.mkdtemp()
+        root = Path(tmp)
+        _git(['init', '-q'], root)
+        _git(['config', 'user.email', 't@t'], root)
+        _git(['config', 'user.name', 't'], root)
+        _git(['config', 'core.autocrlf', 'true'], root)
+        (root / 'Proj').mkdir()
+        (root / 'Proj' / 'P.uvprojx').write_bytes(b'<x/>\r\n')
+        _git(['add', '-A'], root)
+        _git(['commit', '-qm', 'init'], root)
+        # force the unsafe state the guard above normally prevents
+        (root / '.git' / 'info' / 'attributes').write_text(
+            '*.uvprojx -text\n', encoding='utf-8')
+
+        plan = rh.build_plan(rh.RepoState(root))
+        rh.apply_renormalize(plan)
+        staged = subprocess.run(['git', 'diff', '--cached', '--name-only'],
+                                cwd=str(root), stdout=subprocess.PIPE)
+        self.assertEqual(staged.stdout.decode().strip(), '')
+
+    def test_a_full_local_apply_leaves_the_repo_untouched(self):
+        tmp = tempfile.mkdtemp()
+        root = make_repo(tmp, {'main.c': 'x\n', 'Proj/A.uvoptx': '<x/>\n',
+                               'Proj/P.uvprojx': '<x/>\n'},
+                         gitignore="*.o\n")
+        (root / 'Proj' / 'A.uvoptx').write_bytes(b'<y/>\n')
+        (root / 'Proj' / '.clangd').write_bytes(b'x')
+
+        plan = rh.build_plan(rh.RepoState(root))
+        rh.write_ignore(plan)
+        # Same order as the CLI: attributes, then renormalize -- setting -text
+        # can itself turn a clean file into a phantom.
+        rh.write_gitattributes(plan)
+        rh.apply_renormalize(plan)
+        rh.apply_freeze(plan)
+
+        after = rh.RepoState(root)
+        self.assertEqual(after.untracked, [])
+        self.assertEqual(after.modified, set())
+        # nothing the repo carries was altered
+        self.assertEqual((root / '.gitignore').read_text(encoding='utf-8'),
+                         "*.o\n")
+        self.assertFalse((root / '.gitattributes').exists())
+
+
 class TestWriters(unittest.TestCase):
     def test_dry_run_writes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -318,7 +450,7 @@ class TestWriters(unittest.TestCase):
                              gitignore="*.o\n")
             state = rh.RepoState(root)
             plan = rh.build_plan(state)
-            rh.write_gitignore(plan, dry_run=True)
+            rh.write_ignore(plan, shared=True, dry_run=True)
             rh.apply_freeze(plan, dry_run=True)
             self.assertEqual((root / '.gitignore').read_text(encoding='utf-8'),
                              "*.o\n")
@@ -329,7 +461,7 @@ class TestWriters(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = make_repo(tmp, {'main.c': 'x\n'}, gitignore="Doc/x/\n")
             plan = rh.build_plan(rh.RepoState(root))
-            rh.write_gitignore(plan)
+            rh.write_ignore(plan, shared=True)
             self.assertEqual(
                 (root / '.gitignore.bak').read_text(encoding='utf-8'), "Doc/x/\n")
 

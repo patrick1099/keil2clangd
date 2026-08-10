@@ -1,6 +1,23 @@
 #!/usr/bin/env python3
 """Make ``git status`` in an embedded firmware repo show code changes only.
 
+**Local by default.** ``.gitignore`` and ``.gitattributes`` are tracked files
+pulled down from the shared branch; rewriting them turns one person's tidying
+into a commit everyone else has to review, resolve and live with. Every fix
+here therefore has a per-clone form that leaves the repo's contents untouched,
+and that is what runs unless ``--shared`` is passed:
+
+    .gitignore      ->  .git/info/exclude
+    .gitattributes  ->  .git/info/attributes
+    skip-worktree   ->  already local (it lives in .git/index)
+
+The trade is real and stated rather than hidden: nothing local survives a fresh
+clone, and a repo-level ``.gitignore`` rule OUTRANKS ``.git/info/exclude``, so a
+negation cannot be undone from the local side (verified: with ``*.exe`` in
+.gitignore, ``!keep.exe`` in info/exclude loses). Where that bites, the report
+says so instead of writing a rule that quietly does nothing.
+
+
 A Keil/IAR repo generates four kinds of noise, and they need three different
 fixes -- which is the whole reason this is a tool and not a .gitignore snippet
 someone pastes around:
@@ -232,14 +249,32 @@ class RepoState:
                 if tag in ('S', 'h', 's'):
                     self.frozen.add(path)
 
+        # --git-common-dir, not --git-dir: in a linked worktree the two differ,
+        # and info/exclude is read from the COMMON one. Writing to the worktree
+        # copy would have no effect at all.
+        common = git(['rev-parse', '--path-format=absolute',
+                      '--git-common-dir'], self.root, check=False).strip()
+        self.info_dir = Path(common) / 'info' if common \
+            else self.root / '.git' / 'info'
+
     def gitignore_path(self):
         return self.root / '.gitignore'
 
+    def ignore_path(self, shared):
+        return self.gitignore_path() if shared else self.info_dir / 'exclude'
+
+    def attributes_path(self, shared):
+        return (self.root / '.gitattributes') if shared \
+            else self.info_dir / 'attributes'
+
     def read_gitignore(self):
-        p = self.gitignore_path()
-        if not p.is_file():
-            return ''
-        return p.read_text(encoding='utf-8', errors='surrogateescape')
+        return _read(self.gitignore_path())
+
+
+def _read(path):
+    if not Path(path).is_file():
+        return ''
+    return Path(path).read_text(encoding='utf-8', errors='surrogateescape')
 
 
 # ---------------------------------------------------------------------------
@@ -486,8 +521,8 @@ def _classify_old_lines(plan, state, matcher):
 # Rendering and writing
 # ---------------------------------------------------------------------------
 
-def render_gitignore(plan):
-    state = plan.state
+def render_rule_block(plan, shared):
+    """The generated rule block, identical in both targets."""
     lines = [
         "# " + "=" * 74,
         GENERATED_BANNER,
@@ -507,59 +542,119 @@ def render_gitignore(plan):
     if plan.freeze or plan.already_frozen:
         lines += [
             "# ---- 说明:下面这些文件故意不写 ignore 规则 ----",
-            "# *.uvoptx / RTE_Components.h 已经被仓库跟踪了,而 .gitignore 对已跟踪",
+            "# *.uvoptx / RTE_Components.h 已经被仓库跟踪了,而 ignore 规则对已跟踪",
             "# 文件完全无效。它们改用 git update-index --skip-worktree 冻结:文件继",
             "# 续留在仓库里(同事那边毫无变化),只是本机的改动不再被 git 报告。",
             "",
         ]
 
-    lines.append(MANUAL_MARKER)
-    lines += plan.carried if plan.carried else [""]
+    if shared:
+        lines.append(MANUAL_MARKER)
+        lines += plan.carried if plan.carried else [""]
 
-    # Negations go last, below the manual block: git resolves a path by the
-    # LAST pattern that matches it, so a `!foo.exe` sitting above a
-    # hand-written `*.exe` is silently cancelled by it.
-    lines += ["", NEGATION_MARKER]
-    for pat, why in NEGATIONS:
-        lines.append("# {0}".format(why))
-        lines.append(pat)
+        # Negations go last, below the manual block: git resolves a path by the
+        # LAST pattern that matches it, so a `!foo.exe` sitting above a
+        # hand-written `*.exe` is silently cancelled by it.
+        lines += ["", NEGATION_MARKER]
+        for pat, why in NEGATIONS:
+            lines.append("# {0}".format(why))
+            lines.append(pat)
+    else:
+        # No negations in the local file: a repo .gitignore outranks
+        # .git/info/exclude, so `!x` here loses to a tracked `*.exe` every
+        # time. Emitting it would look like a fix and be one line of nothing.
+        lines += [
+            "# ---- 这里不写 ! 例外规则 ----",
+            "# 仓库自己的 .gitignore 优先级高于 .git/info/exclude,本地的 ! 打不过它。",
+            "# 需要放行某个被仓库规则挡住的文件,只能 git add -f,或改共享 .gitignore。",
+        ]
     return '\n'.join(lines).rstrip('\n') + '\n'
 
 
-def write_gitignore(plan, dry_run=False):
-    """Rewrite .gitignore, keeping a .bak of whatever was there.
+def render_gitignore(plan):
+    """Full .gitignore text (shared target)."""
+    return render_rule_block(plan, shared=True)
+
+
+def _strip_generated(text):
+    """Everything in ``text`` that is not our generated block."""
+    if GENERATED_BANNER not in text:
+        return text.rstrip('\n')
+    head = text.split('# ' + '=' * 74 + '\n' + GENERATED_BANNER)[0]
+    if head == text:                       # banner present but framing differs
+        head = text.split(GENERATED_BANNER)[0]
+    return head.rstrip('\n')
+
+
+def write_ignore(plan, shared=False, dry_run=False):
+    """Write the ignore rules, locally by default.
 
     The dry-run gate is inside the writer on purpose: a preview that travels a
     different code path from the real write is a preview of nothing.
     """
     state = plan.state
-    target = state.gitignore_path()
-    new_text = render_gitignore(plan)
-    old_text = state.read_gitignore()
+    target = state.ignore_path(shared)
+    label = '.gitignore' if shared else '.git/info/exclude'
+    old_text = _read(target)
+
+    if shared:
+        new_text = render_gitignore(plan)
+    else:
+        # Everything already in info/exclude is the user's -- git's own stub
+        # comments included -- so it is kept verbatim above our block.
+        kept = _strip_generated(old_text)
+        new_text = (kept + '\n\n' if kept else '') \
+            + render_rule_block(plan, shared=False)
+
     if old_text == new_text:
-        print("  .gitignore: 已经是最新,不动")
+        print("  {0}: 已经是最新,不动".format(label))
         return False
     if dry_run:
-        print("  .gitignore: 将重写 ({0} 行 -> {1} 行),旧文件备份为 .gitignore.bak"
-              .format(len(old_text.splitlines()), len(new_text.splitlines())))
+        extra = ",旧文件备份为 .gitignore.bak" if shared else ",不进仓库,同事无感"
+        print("  {0}: 将写入 ({1} 行 -> {2} 行){3}".format(
+            label, len(old_text.splitlines()), len(new_text.splitlines()), extra))
         return True
-    if old_text:
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if shared and old_text:
         (state.root / '.gitignore.bak').write_text(
             old_text, encoding='utf-8', errors='surrogateescape')
     target.write_text(new_text, encoding='utf-8')
-    print("  .gitignore: 已重写,旧文件保存在 .gitignore.bak")
+    if shared:
+        print("  .gitignore: 已重写(共享文件,会进提交),旧文件保存在 .gitignore.bak")
+    else:
+        print("  {0}: 已写入 —— 纯本地,不进仓库,同事看不到".format(label))
 
     missed = verify_with_git(plan)
     if missed:
-        print("  .gitignore: !! 自检失败 —— 写完之后 git 仍然不忽略这 {0} 个文件:"
-              .format(len(missed)))
+        print("  {0}: !! 自检失败 —— 写完之后 git 仍然不忽略这 {1} 个文件:"
+              .format(label, len(missed)))
         for path in missed[:10]:
             print("      {0}".format(path))
-        print("      规则写进去了但没生效,通常是模式写法不对(.gitignore 不支持行尾注释)。")
+        print("      规则写进去了但没生效,通常是模式写法不对(ignore 文件不支持行尾注释)。")
     else:
-        print("  .gitignore: 自检通过 —— git 确认 {0} 个文件已被忽略"
-              .format(len(plan.newly_ignored)))
+        print("  {0}: 自检通过 —— git 确认 {1} 个文件已被忽略"
+              .format(label, len(plan.newly_ignored)))
     return True
+
+
+def _raw_matches_index(state, path):
+    """True when the file's bytes on disk are exactly what the index stores.
+
+    ``--no-filters`` is load-bearing: plain ``git hash-object`` DOES apply the
+    path's filters when the file sits in a repo (verified -- on a CRLF worktree
+    file with an LF blob the two hashes come out equal), so without it this
+    function answers "does git think it is clean", which is the question that
+    was already asked, instead of "are the bytes the same".
+    """
+    try:
+        raw = git(['hash-object', '--no-filters', '--', path], state.root,
+                  check=False).strip()
+        entry = git(['ls-files', '-s', '--', path], state.root,
+                    check=False).split()
+    except RuntimeError:
+        return False
+    return bool(raw) and len(entry) >= 2 and entry[1] == raw
 
 
 def verify_with_git(plan):
@@ -591,7 +686,7 @@ def verify_with_git(plan):
             if p not in covered and p.rstrip('/') not in covered]
 
 
-def write_gitattributes(plan, dry_run=False):
+def write_gitattributes(plan, shared=False, dry_run=False):
     """Add ``-text`` for the project files git keeps re-converting.
 
     Gated on the repo *containing* such files, not on a phantom being visible
@@ -600,13 +695,36 @@ def write_gitattributes(plan, dry_run=False):
     renormalize would silently skip it, leaving the loop free to come back.
     """
     state = plan.state
-    subjects = [p for p in sorted(state.tracked)
-                if matches_any(GITATTRIBUTES_BINARYISH, p)]
+    candidates = [p for p in sorted(state.tracked)
+                  if matches_any(GITATTRIBUTES_BINARYISH, p)]
+    if not candidates:
+        return False
+
+    # -text is only safe where the worktree bytes ALREADY equal the stored
+    # blob. Where they differ -- worktree CRLF against a blob normalised to LF,
+    # the usual case for a file committed under core.autocrlf -- switching off
+    # normalisation does not reveal a phantom, it MANUFACTURES a real diff, and
+    # the renormalize that follows would commit the CRLF bytes. That is a junk
+    # commit touching every project file in the repo.
+    unsafe = [p for p in candidates if not _raw_matches_index(state, p)]
+    subjects = [p for p in candidates if p not in set(unsafe)]
+    if unsafe:
+        print("  {0}: 跳过 —— 这 {1} 个文件盘上的字节与仓库里存的不一致(多半是"
+              "工作区 CRLF、仓库 LF)。".format(
+                  '.gitattributes' if shared else '.git/info/attributes',
+                  len(unsafe)))
+        for path in unsafe[:5]:
+            print("      {0}".format(path))
+        print("      对它们加 -text 不是暴露幻影,是凭空造出一个真实差异,"
+              "接着 renormalize 会把 CRLF 提交进去。")
     if not subjects:
         return False
-    target = state.root / '.gitattributes'
-    old = target.read_text(encoding='utf-8', errors='surrogateescape') \
-        if target.is_file() else ''
+    target = state.attributes_path(shared)
+    label = '.gitattributes' if shared else '.git/info/attributes'
+    # Append only. This file is where a repo's local clean/smudge filters get
+    # installed, and clobbering one would break it with no visible symptom
+    # until the wrong bytes are already committed.
+    old = _read(target)
     needed = [(p, why) for p, why in GITATTRIBUTES_BINARYISH
               if p not in old]
     if not needed:
@@ -620,12 +738,15 @@ def write_gitattributes(plan, dry_run=False):
         block.append("# {0}".format(why))
         block.append("{0} -text".format(pattern))
     if dry_run:
-        print("  .gitattributes: 将追加 {0} 条 -text 规则".format(len(needed)))
+        print("  {0}: 将追加 {1} 条 -text 规则{2}".format(
+            label, len(needed), "" if shared else "(纯本地)"))
         return True
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text((old.rstrip('\n') + '\n' if old else '')
                       + '\n'.join(block).lstrip('\n') + '\n',
                       encoding='utf-8', errors='surrogateescape')
-    print("  .gitattributes: 已追加 {0} 条 -text 规则".format(len(needed)))
+    print("  {0}: 已追加 {1} 条 -text 规则{2}".format(
+        label, len(needed), "(共享文件,会进提交)" if shared else " —— 纯本地"))
 
     # git puts the "not a valid attribute name" complaint on stderr, so the
     # normal helper -- stdout only -- would call a dead rule healthy.
@@ -634,11 +755,11 @@ def write_gitattributes(plan, dry_run=False):
                           stderr=subprocess.STDOUT)
     out = proc.stdout.decode('utf-8', 'surrogateescape')
     if 'not a valid attribute name' in out or ': text: unspecified' in out:
-        print("  .gitattributes: !! 自检失败 —— git 没有认下这些规则:")
+        print("  {0}: !! 自检失败 —— git 没有认下这些规则:".format(label))
         for line in out.splitlines()[:6]:
             print("      {0}".format(line))
     else:
-        print("  .gitattributes: 自检通过 —— git 确认工程文件已不做换行转换")
+        print("  {0}: 自检通过 —— git 确认工程文件已不做换行转换".format(label))
     return True
 
 
@@ -671,19 +792,38 @@ def apply_unfreeze(state, paths, dry_run=False):
 
 
 def apply_renormalize(plan, dry_run=False):
-    """Clear the phantom-modified flag. Stages nothing when content matches."""
-    if not plan.renormalize:
-        return False
+    """Clear the phantom-modified flag. Stages nothing when content matches.
+
+    The phantom list is re-derived here rather than taken from the plan: the
+    caller writes the ``-text`` attribute first, and that write itself can turn
+    a previously clean file into a phantom. A list built before it is stale.
+    """
     if dry_run:
+        if not plan.renormalize:
+            return False
         print("  换行归一: 将对 {0} 个「内容没变却显示已修改」的文件 "
               "git add --renormalize".format(len(plan.renormalize)))
         return True
-    git(['add', '--renormalize'] + plan.renormalize, plan.state.root)
-    staged = git(['diff', '--cached', '--name-only'], plan.state.root).split()
-    print("  换行归一: {0} 个文件已归一".format(len(plan.renormalize)))
-    if staged:
-        print("    注意: 有 {0} 个文件真的进了暂存区(内容确实变了),"
-              "请自行检查 git diff --cached".format(len(staged)))
+    root = plan.state.root
+    targets = RepoState(root).phantom
+    if not targets:
+        return False
+    before = set(git_z(['diff', '--cached', '--name-only', '-z'], root))
+    git(['add', '--renormalize'] + targets, root)
+    after = set(git_z(['diff', '--cached', '--name-only', '-z'], root))
+
+    # A genuinely phantom file stages nothing. Anything that did stage was a
+    # real content change we misread -- so undo it rather than leave a silent
+    # byte-level edit sitting in the index waiting to be committed.
+    leaked = sorted(after - before)
+    if leaked:
+        git(['reset', '-q', '--'] + leaked, root, check=False)
+        print("  换行归一: !! {0} 个文件其实内容真的不同,已撤出暂存区,未做改动:"
+              .format(len(leaked)))
+        for path in leaked[:5]:
+            print("      {0}".format(path))
+        return False
+    print("  换行归一: {0} 个文件已归一(未 stage 任何内容)".format(len(targets)))
     return True
 
 
@@ -698,12 +838,16 @@ def _bullet(items, limit=12):
     return out
 
 
-def describe(plan):
+def describe(plan, shared=False):
     state = plan.state
     lines = ["", "=" * 78, "仓库: {0}".format(state.root), "=" * 78]
+    lines.append("模式: {0}".format(
+        "共享 —— 会改 .gitignore / .gitattributes,这是要进提交、同事会看到的改动"
+        if shared else
+        "本地 —— 只写 .git/info/ 与 .git/index,一个字节都不进仓库,同事无感"))
 
     lines.append("")
-    lines.append("[1] .gitignore 能解决的 —— 未跟踪的生成物")
+    lines.append("[1] ignore 规则能解决的 —— 未跟踪的生成物")
     if plan.newly_ignored:
         lines.append("  {0} 个文件/目录将被新规则挡住:".format(len(plan.newly_ignored)))
         lines += _bullet(plan.newly_ignored)
@@ -716,7 +860,7 @@ def describe(plan):
         lines.append("    (这些多半是真该提交的东西 —— 如果不是,告诉我加规则)")
 
     lines.append("")
-    lines.append("[2] .gitignore 解决不了的 —— 已跟踪、但只有本机在改")
+    lines.append("[2] ignore 规则解决不了的 —— 已跟踪、但只有本机在改")
     if plan.freeze:
         lines.append("  {0} 个文件建议 skip-worktree 冻结:".format(len(plan.freeze)))
         for path, why in plan.freeze[:12]:
@@ -741,8 +885,9 @@ def describe(plan):
         lines.append("  {0} 个文件的工作区内容与仓库内容逐字节相同,是 core.autocrlf "
                      "的换行折腾:".format(len(plan.renormalize)))
         lines += _bullet(plan.renormalize)
-        lines.append("  修法: git add --renormalize(不会 stage 任何内容)"
-                     " + .gitattributes 标 -text 防复发")
+        lines.append("  修法: git add --renormalize(不会 stage 任何内容) + {0} 标 "
+                     "-text 防复发".format(
+                         ".gitattributes" if shared else ".git/info/attributes"))
     else:
         lines.append("  无")
 
@@ -758,26 +903,33 @@ def describe(plan):
         lines.append("  无")
 
     lines.append("")
-    lines.append("[5] 现有 .gitignore 体检")
+    lines.append("[5] 仓库自带 .gitignore 的体检" if shared
+                 else "[5] 仓库自带 .gitignore 的体检(只读 —— 本地模式不碰它)")
     legacy, preserved = split_existing(state.read_gitignore())
     old_count = len([l for l in legacy.splitlines()
                      if l.strip() and not l.strip().startswith('#')])
     if preserved:
         lines.append("  已是本工具生成的格式;「手工增补」区 {0} 行原样保留"
                      .format(len(preserved)))
-    lines.append("  待归类的旧规则行: {0}".format(old_count))
-    lines.append("  被通配规则吸收(可以删掉的死路径): {0}".format(len(plan.absorbed)))
+    lines.append("  有效规则行: {0}".format(old_count))
+    verb = "被通配规则吸收(可以删掉的死路径)" if shared \
+        else "本工具的通配规则已覆盖(改共享文件时可删的冗余行)"
+    lines.append("  {0}: {1}".format(verb, len(plan.absorbed)))
     if plan.absorbed:
         lines += _bullet(plan.absorbed, limit=8)
-    lines.append("  无规则覆盖、原样搬进「手工增补」区: {0}".format(len(plan.carried)))
     if plan.dead:
-        lines.append("  其中指向已不存在路径的: {0}".format(len(plan.dead)))
+        lines.append("  指向已不存在路径的死行: {0}".format(len(plan.dead)))
         lines += _bullet(plan.dead, limit=8)
     if plan.dangerous:
-        lines.append("  !! 危险规则,已从生成文件中剔除,请确认: {0}"
-                     .format(len(plan.dangerous)))
+        lines.append("  !! 危险规则: {0}{1}".format(
+            len(plan.dangerous),
+            " —— 已从生成文件中剔除,请确认" if shared
+            else " —— 本地模式不动它们,但你该知道它们在那儿"))
         for line, why in plan.dangerous:
             lines.append("    - {0}    <- {1}".format(line, why))
+    if not shared and (plan.absorbed or plan.dead or plan.dangerous):
+        lines.append("  想真的整理这个共享文件,加 --shared —— 那会产生一个同事要 "
+                     "review 的提交,先跟他们打招呼。")
     if plan.shadowed:
         lines.append("  规则被已跟踪文件架空(规则写了也不生效,得靠 [2] 冻结): {0}"
                      .format(len(plan.shadowed)))
@@ -795,6 +947,13 @@ SKIP_WORKTREE_CAVEATS = """
      "Your local changes to the following files would be overwritten"。
      解法: RepoHygiene.py --unfreeze <文件> 之后再拉,拉完重新冻结。
   3. 想主动提交某个冻结文件的改动: --unfreeze 它 -> git add/commit -> --freeze。
+"""
+
+LOCAL_MODE_CAVEATS = """本地模式的代价(换来的是仓库和同事完全不受影响):
+  * 写的是 .git/info/exclude、.git/info/attributes 和 .git/index —— 这三样都
+    **不会被 clone、不会被 push**,重新 clone 一份就没了,要重跑。
+  * 仓库自己的 .gitignore 优先级**高于** .git/info/exclude,所以被仓库规则挡住
+    的文件,本地放不出来(`!xxx` 在这里打不过)。只能 git add -f,或走 --shared。
 """
 
 
@@ -817,18 +976,24 @@ def iter_repos(root, each):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="让 git status 只显示代码改动:生成 .gitignore、冻结本机状态"
-                    "文件、修掉换行造成的幻影修改。默认只扫描不写。")
+        description="让 git status 只显示代码改动:ignore 规则 + 冻结本机状态文件 + "
+                    "修掉换行造成的幻影修改。默认只扫描不写,且只写本机(.git/info/、"
+                    ".git/index),一个字节都不进仓库。")
     parser.add_argument('-p', '--path', default='.',
                         help="仓库目录(默认当前目录)")
     parser.add_argument('--each', action='store_true',
                         help="把 --path 当作父目录,逐个处理其下的每个仓库")
+    parser.add_argument('--shared', action='store_true',
+                        help="改共享文件 .gitignore / .gitattributes 而不是 "
+                             ".git/info/ —— 这会产生同事要 review 的提交,默认关闭")
+    parser.add_argument('--write-ignore', action='store_true',
+                        help="写 ignore 规则(默认写 .git/info/exclude)")
     parser.add_argument('--write-gitignore', action='store_true',
-                        help="重写 .gitignore(旧文件存为 .gitignore.bak)")
+                        help="等同 --write-ignore --shared(保留的旧写法)")
     parser.add_argument('--freeze', action='store_true',
                         help="对 [2] 里的文件设置 skip-worktree")
     parser.add_argument('--renormalize', action='store_true',
-                        help="修掉 [3] 里的幻影修改,并写 .gitattributes 防复发")
+                        help="修掉 [3] 里的幻影修改,并写 -text 属性防复发")
     parser.add_argument('--apply', action='store_true',
                         help="等于同时给上面三个开关")
     parser.add_argument('--unfreeze', nargs='*', metavar='PATH',
@@ -842,10 +1007,10 @@ def main(argv=None):
         print("没有找到 git 仓库: {0}".format(Path(args.path).resolve()))
         return 1
 
-    do_ignore = args.write_gitignore or args.apply
+    shared = args.shared or args.write_gitignore
+    do_ignore = args.write_ignore or args.write_gitignore or args.apply
     do_freeze = args.freeze or args.apply
     do_renorm = args.renormalize or args.apply
-    wrote_anything = False
 
     for root in repos:
         state = RepoState(root)
@@ -860,30 +1025,38 @@ def main(argv=None):
             continue
 
         plan = build_plan(state)
-        print(describe(plan))
+        print(describe(plan, shared=shared))
 
         if not (do_ignore or do_freeze or do_renorm):
             continue
 
         print("")
-        print("执行{0}:".format(" (--dry-run,不落盘)" if args.dry_run else ""))
+        print("执行{0}{1}:".format(
+            " [共享模式 —— 会改进仓库的文件]" if shared else " [本地模式]",
+            " (--dry-run,不落盘)" if args.dry_run else ""))
         if do_ignore:
-            wrote_anything |= write_gitignore(plan, dry_run=args.dry_run)
+            write_ignore(plan, shared=shared, dry_run=args.dry_run)
         if do_renorm:
-            wrote_anything |= apply_renormalize(plan, dry_run=args.dry_run)
-            wrote_anything |= write_gitattributes(plan, dry_run=args.dry_run)
+            # Attributes first: setting -text changes how git normalises, so
+            # the write itself can turn a clean file into a fresh phantom.
+            # Renormalising before that would leave the new ones unfixed.
+            write_gitattributes(plan, shared=shared, dry_run=args.dry_run)
+            apply_renormalize(plan, dry_run=args.dry_run)
         if do_freeze:
-            wrote_anything |= apply_freeze(plan, dry_run=args.dry_run)
+            apply_freeze(plan, dry_run=args.dry_run)
             if plan.freeze:
                 print(SKIP_WORKTREE_CAVEATS)
+        if not shared:
+            print(LOCAL_MODE_CAVEATS)
 
     if not (do_ignore or do_freeze or do_renorm) and args.unfreeze is None:
         print("")
-        print("以上只是扫描,什么都没写。要执行:")
-        print("  --write-gitignore   只重写 .gitignore")
+        print("以上只是扫描,什么都没写。要执行(默认全走本机,不碰仓库文件):")
+        print("  --write-ignore      只写 .git/info/exclude")
         print("  --freeze            只冻结 [2] 里的文件")
         print("  --renormalize       只修 [3] 的幻影修改")
         print("  --apply             三样都做      (加 --dry-run 先预演)")
+        print("  --shared            改成写仓库里的 .gitignore / .gitattributes")
     return 0
 
 
