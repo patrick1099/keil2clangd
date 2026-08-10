@@ -1,5 +1,9 @@
 # keil2clangd — Claude Code 插件
 
+嵌入式仓库初始化两件套:**让编辑器看懂工程**(clangd 配置),**让 git 只报代码改动**(repo-hygiene)。
+
+## 一、生成 clangd 配置
+
 给嵌入式 C 工程生成并校验 `.clangd` + `compile_commands.json`,让 VS Code 的 clangd 做跳转、补全和诊断。支持三种工程:
 
 | 工程 | 识别 | 后端 | 做法 |
@@ -53,19 +57,46 @@ clangd 只在源文件自身目录和**祖先目录**里找配置,**从不看兄
 
 三个后端现在都会自动检查并打印 `placement: OK` / `placement: PROBLEM`,并能在源码的最近公共祖先目录写一个指针 `.clangd`(Keil/IAR 加 `--fix-placement`,CMake 默认就做)。
 
+## 二、repo-hygiene — 让 `git status` 只剩代码
+
+Keil/IAR 仓库的待提交列表长期被编译残留、IDE 状态和索引配置淹没。这些噪音看着是一类,实际需要**三种互不通用**的修法,选错了不是效果差,是根本不生效、或者把同事的文件删了:
+
+| 噪音 | 例子 | 修法 | 用错会怎样 |
+|---|---|---|---|
+| 未跟踪的生成物 | `Objects/`、`*.map`、`.clangd`、`~$说明书.docx` | `.gitignore` | — |
+| **已跟踪**、只有本机在改 | `*.uvoptx`、`RTE_Components.h`、IAR `*.pbd` | `git update-index --skip-worktree` | `.gitignore` 对已跟踪文件**完全无效**;`git rm --cached` 会在同事下次 pull 时**删掉他们的文件** |
+| 内容没变却显示"已修改" | `*.uvprojx` | `git add --renormalize` + `.gitattributes -text` | 前两种都碰不到它 |
+| 只有仓库主人能判断 | `Release/Useful/*.bin` | 报告,不动 | 猜错就是丢发布固件 |
+
+```bash
+py -3 scripts/RepoHygiene.py -p <repo>                # 只扫描,默认什么都不写
+py -3 scripts/RepoHygiene.py -p <父目录> --each        # 扫描其下每个仓库
+py -3 scripts/RepoHygiene.py -p <repo> --apply --dry-run
+py -3 scripts/RepoHygiene.py -p <repo> --apply
+py -3 scripts/RepoHygiene.py -p <repo> --unfreeze [<路径>...]
+```
+
+生成的 `.gitignore` 分三段:生成块(每组规则带一句为什么)、手工增补区(旧文件里无规则覆盖的行原样搬进来,重跑不动它)、例外区(`!keil2clangd-reanchor.exe`,**必须在最后**,因为 git 按最后一条匹配的规则决定)。旧文件存 `.gitignore.bak`。
+
+**写完用真 git 自检。** `.gitignore` 和 `.gitattributes` 都**不支持行尾注释**——`Objects/  # 输出目录` 会被 git 当成一个含空格和 `#` 的模式,匹配不到任何东西,而 git 从不报告"这条规则没匹配上任何文件"。所以自检问的不是"文件写出去了吗",是"git 现在真的忽略这些文件了吗"(`git check-ignore -z --stdin` / `git check-attr`)。
+
+`*.uvprojx` **永不冻结**——它是真正的工程定义(源文件清单、编译宏、优化等级),改了必须提交。
+
 ## 结构
 
 ```
 .claude-plugin/plugin.json       插件清单
 .claude-plugin/marketplace.json  可直接作为 marketplace 安装
-skills/keil2clangd/SKILL.md      skill(流程 + 校验)
+skills/keil2clangd/SKILL.md      skill(clangd 配置流程 + 校验)
+skills/repo-hygiene/SKILL.md     skill(git 噪音治理)
+scripts/RepoHygiene.py           .gitignore / skip-worktree 冻结 / 换行归一
 scripts/Proj2Clangd.py           统一入口:识别工程类型并分发
 scripts/k2c_common.py            共用:路径格式化 / .clangd 渲染 / 数据库写出 / 位置校验
 scripts/Keil2Clangd.py           Keil 后端
 scripts/Iar2Clangd.py            IAR 后端
 scripts/Cmake2Clangd.py          CMake 后端
 scripts/ReAnchor.py              搬家/换机修复(仅 Keil)
-scripts/tests/                   140 个单元测试,py -3 -m pytest
+scripts/tests/                   239 个单元测试,py -3 -m pytest
 ```
 
 ## 工程搬家 / 换机(re-anchor)
