@@ -1,4 +1,15 @@
-# keil2clangd — Claude Code 插件
+# keil2clangd — Claude Code 插件（已归档）
+
+> **⚠️ 本仓已归档,不再更新。继任者是
+> [repo-keeper](https://github.com/patrick1099/repo-keeper)。**
+>
+> 这里的两个 skill 原样搬了过去(`clangd-config` 与 `repo-hygiene`),另外多了一个
+> 分支对账环节和一个总入口 —— 四件事其实是同一条主线的四个环节:**保住一条干净分支,
+> 只让代码提交进去**。新仓只需要记 `using-repo-keeper` 一个名字,它自己分派。
+>
+> 迁移只有两步:装上 repo-keeper,然后把 `~/.claude/settings.json` 的
+> `enabledPlugins` 里这一条换掉。探到的 Keil/IAR 工具链路径会自动从
+> `~/.keil2clangd.json` 继承过去,不用重填。
 
 嵌入式仓库初始化两件套:**让编辑器看懂工程**(clangd 配置),**让 git 只报代码改动**(repo-hygiene)。
 
