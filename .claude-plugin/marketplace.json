@@ -2,13 +2,13 @@
   "name": "keil2clangd",
   "owner": { "name": "xu" },
   "metadata": {
-    "description": "Keil/IAR/CMake 工程的 clangd 配置生成插件"
+    "description": "嵌入式仓库初始化:clangd 配置生成 + git 噪音治理"
   },
   "plugins": [
     {
       "name": "keil2clangd",
       "source": ".",
-      "description": "从 Keil .uvprojx / IAR .ewp(任意架构)/ CMake 工程生成并校验 .clangd + compile_commands.json,让 clangd 对嵌入式 C 工程做跳转/补全/诊断"
+      "description": "嵌入式仓库初始化两件套:① 从 Keil .uvprojx / IAR .ewp(任意架构)/ CMake 工程生成并校验 .clangd + compile_commands.json;② repo-hygiene 让 git status 只剩代码改动(.gitignore + skip-worktree 冻结 + 换行归一)"
     }
   ]
 }
